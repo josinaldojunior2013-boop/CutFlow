@@ -96,7 +96,7 @@ def render_cuts(
                         "-map",
                         "1:a:0",
                         "-vf",
-                        "fps=30,format=yuv420p",
+                        "fps=30,pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p",
                         "-shortest",
                     ]
                 )
