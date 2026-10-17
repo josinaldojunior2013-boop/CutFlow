@@ -20,6 +20,7 @@ def _run_ffmpeg(command: list[str]) -> None:
         text=True,
         encoding="utf-8",
         errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if result.returncode:
         message = result.stderr.strip() or f"FFmpeg terminou com código {result.returncode}."
