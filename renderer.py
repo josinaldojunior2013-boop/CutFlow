@@ -61,6 +61,16 @@ def render_cuts(
             if not cut.path.is_file():
                 raise FileNotFoundError(f"Arquivo de vídeo não encontrado: {cut.path}")
             part_path = temp_path / f"part_{index:05d}.mp4"
+            is_still_image = cut.path.suffix.lower() in {
+                ".bmp",
+                ".gif",
+                ".jpeg",
+                ".jpg",
+                ".png",
+                ".tif",
+                ".tiff",
+                ".webp",
+            }
             command = [
                 ffmpeg,
                 "-y",
@@ -68,10 +78,30 @@ def render_cuts(
                 "-loglevel",
                 "error",
                 "-nostats",
-                "-ss",
-                str(cut.start),
-                "-i",
-                str(cut.path),
+            ]
+            if is_still_image:
+                command.extend(["-loop", "1"])
+            else:
+                command.extend(["-ss", str(cut.start)])
+            command.extend(["-i", str(cut.path)])
+            if is_still_image:
+                command.extend(
+                    [
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "anullsrc=channel_layout=stereo:sample_rate=44100",
+                        "-map",
+                        "0:v:0",
+                        "-map",
+                        "1:a:0",
+                        "-vf",
+                        "fps=30,format=yuv420p",
+                        "-shortest",
+                    ]
+                )
+            command.extend(
+                [
                 "-t",
                 str(cut.duration),
                 "-c:v",
@@ -85,7 +115,8 @@ def render_cuts(
                 "-movflags",
                 "+faststart",
                 str(part_path),
-            ]
+                ]
+            )
             _run_ffmpeg(command)
             rendered_parts.append(part_path)
 

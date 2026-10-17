@@ -28,7 +28,9 @@ def _seconds(value: Any) -> float:
 def _resolve_media_path(raw_path: str, draft_dir: Path) -> Path:
     media_path = Path(raw_path).expanduser()
     if not media_path.is_absolute():
-        return (draft_dir / media_path).resolve()
+        direct_path = (draft_dir / media_path).resolve()
+        if direct_path.is_file():
+            return direct_path
     if media_path.is_file():
         return media_path.resolve()
 
@@ -37,10 +39,25 @@ def _resolve_media_path(raw_path: str, draft_dir: Path) -> Path:
         (index for index, part in enumerate(parts) if part.lower() == "resources"),
         None,
     )
-    if resources_index is not None:
-        relocated_path = draft_dir.joinpath(*parts[resources_index:])
+    if resources_index is None:
+        return media_path.resolve()
+
+    resource_parts = parts[resources_index + 1 :]
+    resource_roots = [draft_dir / "Resources"]
+    resource_roots.extend(
+        path for path in draft_dir.rglob("Resources") if path.is_dir()
+    )
+    for resource_root in dict.fromkeys(resource_roots):
+        relocated_path = resource_root.joinpath(*resource_parts)
         if relocated_path.is_file():
             return relocated_path.resolve()
+
+    for resource_root in dict.fromkeys(resource_roots):
+        if not resource_root.is_dir():
+            continue
+        matches = [path for path in resource_root.rglob(media_path.name) if path.is_file()]
+        if len(matches) == 1:
+            return matches[0].resolve()
     return media_path.resolve()
 
 
