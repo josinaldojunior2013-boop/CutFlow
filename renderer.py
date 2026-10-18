@@ -45,7 +45,6 @@ def resolve_ffmpeg(ffmpeg: str | None) -> str:
 
 
 STILL_IMAGE_SUFFIXES = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
-TIMELINE_EPSILON = 1e-9
 
 
 def _ffmpeg_base(ffmpeg: str) -> list[str]:
@@ -54,6 +53,10 @@ def _ffmpeg_base(ffmpeg: str) -> list[str]:
 
 def _is_still_image(path: Path) -> bool:
     return path.suffix.lower() in STILL_IMAGE_SUFFIXES
+
+
+def _ffmpeg_seconds(value: float) -> str:
+    return f"{value:.9f}".rstrip("0").rstrip(".") or "0"
 
 
 def _render_transparent_segment(
@@ -71,14 +74,14 @@ def _render_transparent_segment(
     if _is_still_image(segment.path):
         command.extend(["-loop", "1", "-framerate", str(project.fps)])
     elif source_start > 0:
-        command.extend(["-ss", str(source_start)])
+        command.extend(["-ss", _ffmpeg_seconds(source_start)])
     command.extend(["-i", str(segment.path)])
     if segment.track_type == "audio":
         raise ValueError("Faixas de áudio não podem ser renderizadas como vídeo.")
 
     speed = segment.speed if segment.speed > 0 else 1.0
     filter_chain = (
-        f"setpts=(PTS-STARTPTS)/{speed},fps={project.fps},"
+        f"setpts=(PTS-STARTPTS)/{_ffmpeg_seconds(speed)},fps={project.fps},"
         f"scale={project.width}:{project.height}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
         f"format=rgba,pad={project.width}:{project.height}:(ow-iw)/2:(oh-ih)/2:color=0x00000000,"
         "setsar=1,format=argb"
@@ -86,7 +89,7 @@ def _render_transparent_segment(
     command.extend(
         [
             "-t",
-            str(duration),
+            _ffmpeg_seconds(duration),
             "-an",
             "-vf",
             filter_chain,
@@ -114,7 +117,7 @@ def _render_transparent_gap(
             "-f",
             "lavfi",
             "-i",
-            f"color=c=black@0.0:s={project.width}x{project.height}:r={project.fps}:d={duration},format=rgba",
+            f"color=c=black@0.0:s={project.width}x{project.height}:r={project.fps}:d={_ffmpeg_seconds(duration)},format=rgba",
             "-an",
             "-c:v",
             "qtrle",
@@ -160,43 +163,58 @@ def _render_video_tracks(
             video_tracks.setdefault(segment.track_index, []).append(segment)
 
     rendered_tracks: list[Path] = []
+    frame_rate = project.fps
+    project_frames = max(round(project.duration * frame_rate), 1)
     for track_index, segments in sorted(video_tracks.items()):
         parts: list[Path] = []
-        cursor = 0.0
+        cursor_frame = 0
         ordered_segments = sorted(segments, key=lambda item: item.timeline_start)
         for index, segment in enumerate(ordered_segments):
-            start = max(segment.timeline_start, 0.0)
-            if abs(start - cursor) <= TIMELINE_EPSILON:
-                cursor = start
-            elif start > cursor:
-                gap_path = temp_path / f"track_{track_index:03d}_gap_{index:05d}.mov"
-                _render_transparent_gap(gap_path, project, ffmpeg, start - cursor)
-                parts.append(gap_path)
-                cursor = start
+            start_frame = max(round(segment.timeline_start * frame_rate), 0)
+            end_frame = min(
+                round((segment.timeline_start + segment.duration) * frame_rate),
+                project_frames,
+            )
+            if end_frame <= start_frame:
+                continue
 
-            overlap = max(cursor - start, 0.0)
-            duration = min(segment.duration - overlap, project.duration - cursor)
+            if start_frame > cursor_frame:
+                gap_path = temp_path / f"track_{track_index:03d}_gap_{index:05d}.mov"
+                gap_duration = (start_frame - cursor_frame) / frame_rate
+                _render_transparent_gap(gap_path, project, ffmpeg, gap_duration)
+                parts.append(gap_path)
+                cursor_frame = start_frame
+
+            overlap_frames = max(cursor_frame - start_frame, 0)
+            duration_frames = min(end_frame - cursor_frame, project_frames - cursor_frame)
             if index + 1 < len(ordered_segments):
-                next_start = ordered_segments[index + 1].timeline_start
-                duration = min(duration, max(next_start - cursor, 0.0))
-            if duration <= TIMELINE_EPSILON:
+                next_start_frame = max(
+                    round(ordered_segments[index + 1].timeline_start * frame_rate), 0
+                )
+                duration_frames = min(
+                    duration_frames, max(next_start_frame - cursor_frame, 0)
+                )
+            if duration_frames <= 0:
                 continue
 
             part_path = temp_path / f"track_{track_index:03d}_clip_{index:05d}.mov"
+            duration = duration_frames / frame_rate
             _render_transparent_segment(
                 segment,
                 part_path,
                 project,
                 ffmpeg,
                 duration,
-                segment.source_start + overlap * max(segment.speed, 0.0),
+                segment.source_start
+                + (overlap_frames / frame_rate) * max(segment.speed, 0.0),
             )
             parts.append(part_path)
-            cursor += duration
+            cursor_frame += duration_frames
 
-        if project.duration - cursor > TIMELINE_EPSILON:
+        if project_frames - cursor_frame > 0:
             gap_path = temp_path / f"track_{track_index:03d}_tail.mov"
-            _render_transparent_gap(gap_path, project, ffmpeg, project.duration - cursor)
+            tail_duration = (project_frames - cursor_frame) / frame_rate
+            _render_transparent_gap(gap_path, project, ffmpeg, tail_duration)
             parts.append(gap_path)
 
         if parts:
@@ -214,12 +232,12 @@ def _render_audio_inputs(
     for index, segment in enumerate(segments):
         if not segment.path.is_file():
             raise FileNotFoundError(f"Arquivo de áudio não encontrado: {segment.path}")
-        command_start = ["-ss", str(segment.source_start)] if segment.source_start > 0 else []
+        command_start = ["-ss", _ffmpeg_seconds(segment.source_start)] if segment.source_start > 0 else []
         inputs.extend(command_start + ["-i", str(segment.path)])
         delay_ms = max(round(segment.timeline_start * 1000), 0)
         filters.append(
-            f"[{index}:a]atrim=duration={segment.duration},asetpts=PTS-STARTPTS,"
-            f"volume={segment.volume},adelay={delay_ms}:all=1[a{index}]"
+            f"[{index}:a]atrim=duration={_ffmpeg_seconds(segment.duration)},asetpts=PTS-STARTPTS,"
+            f"volume={_ffmpeg_seconds(segment.volume)},adelay={delay_ms}:all=1[a{index}]"
         )
     labels = "".join(f"[a{index}]" for index in range(len(segments)))
     filters.append(
@@ -287,7 +305,7 @@ def render_timeline(
             )
             filters.append(
                 f"{labels}amix=inputs={len(audio_segments)}:duration=longest:dropout_transition=0,"
-                f"atrim=duration={project.duration}[aout]"
+                f"atrim=duration={_ffmpeg_seconds(project.duration)}[aout]"
             )
 
         filter_script.write_text(";\n".join(filters), encoding="utf-8")
@@ -306,7 +324,7 @@ def render_timeline(
         command.extend(
             [
                 "-t",
-                str(project.duration),
+                _ffmpeg_seconds(project.duration),
                 "-c:v",
                 "libx264",
                 "-preset",
