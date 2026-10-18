@@ -66,6 +66,7 @@ def _render_transparent_segment(
     ffmpeg: str,
     duration: float,
     source_start: float,
+    preserve_alpha: bool,
 ) -> None:
     if not segment.path.is_file():
         raise FileNotFoundError(f"Arquivo de mídia não encontrado: {segment.path}")
@@ -80,12 +81,15 @@ def _render_transparent_segment(
         raise ValueError("Faixas de áudio não podem ser renderizadas como vídeo.")
 
     speed = segment.speed if segment.speed > 0 else 1.0
+    pixel_format = "argb" if preserve_alpha else "yuv420p"
+    pad_color = "0x00000000" if preserve_alpha else "black"
     filter_chain = (
         f"setpts=(PTS-STARTPTS)/{_ffmpeg_seconds(speed)},fps={project.fps},"
         f"scale={project.width}:{project.height}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
-        f"format=rgba,pad={project.width}:{project.height}:(ow-iw)/2:(oh-ih)/2:color=0x00000000,"
-        "setsar=1,format=argb"
+        f"format=rgba,pad={project.width}:{project.height}:(ow-iw)/2:(oh-ih)/2:color={pad_color},"
+        f"setsar=1,format={pixel_format}"
     )
+    video_codec = "qtrle" if preserve_alpha else "libx264"
     command.extend(
         [
             "-t",
@@ -94,9 +98,10 @@ def _render_transparent_segment(
             "-vf",
             filter_chain,
             "-c:v",
-            "qtrle",
+            video_codec,
+            *(["-preset", "ultrafast", "-crf", "20"] if not preserve_alpha else []),
             "-pix_fmt",
-            "argb",
+            pixel_format,
             "-r",
             str(project.fps),
             str(output_path),
@@ -110,19 +115,26 @@ def _render_transparent_gap(
     project: TimelineProject,
     ffmpeg: str,
     duration: float,
+    preserve_alpha: bool,
 ) -> None:
+    pixel_format = "argb" if preserve_alpha else "yuv420p"
+    color = "black@0.0" if preserve_alpha else "black"
+    pixel_filter = "rgba" if preserve_alpha else "yuv420p"
+    video_codec = "qtrle" if preserve_alpha else "libx264"
+    encoder_args = ["-preset", "ultrafast", "-crf", "20"] if not preserve_alpha else []
     _run_ffmpeg(
         _ffmpeg_base(ffmpeg)
         + [
             "-f",
             "lavfi",
             "-i",
-            f"color=c=black@0.0:s={project.width}x{project.height}:r={project.fps}:d={_ffmpeg_seconds(duration)},format=rgba",
+            f"color=c={color}:s={project.width}x{project.height}:r={project.fps}:d={_ffmpeg_seconds(duration)},format={pixel_filter}",
             "-an",
             "-c:v",
-            "qtrle",
+            video_codec,
+            *encoder_args,
             "-pix_fmt",
-            "argb",
+            pixel_format,
             str(output_path),
         ]
     )
@@ -146,12 +158,11 @@ def _concat_track(parts: list[Path], output_path: Path, ffmpeg: str) -> None:
             str(concat_file),
             "-an",
             "-c:v",
-            "qtrle",
-            "-pix_fmt",
-            "argb",
+            "copy",
             str(output_path),
         ]
     )
+    concat_file.unlink(missing_ok=True)
 
 
 def _render_video_tracks(
@@ -165,7 +176,9 @@ def _render_video_tracks(
     rendered_tracks: list[Path] = []
     frame_rate = project.fps
     project_frames = max(round(project.duration * frame_rate), 1)
+    base_track_index = min(video_tracks)
     for track_index, segments in sorted(video_tracks.items()):
+        preserve_alpha = track_index != base_track_index
         parts: list[Path] = []
         cursor_frame = 0
         ordered_segments = sorted(segments, key=lambda item: item.timeline_start)
@@ -181,7 +194,9 @@ def _render_video_tracks(
             if start_frame > cursor_frame:
                 gap_path = temp_path / f"track_{track_index:03d}_gap_{index:05d}.mov"
                 gap_duration = (start_frame - cursor_frame) / frame_rate
-                _render_transparent_gap(gap_path, project, ffmpeg, gap_duration)
+                _render_transparent_gap(
+                    gap_path, project, ffmpeg, gap_duration, preserve_alpha
+                )
                 parts.append(gap_path)
                 cursor_frame = start_frame
 
@@ -207,6 +222,7 @@ def _render_video_tracks(
                 duration,
                 segment.source_start
                 + (overlap_frames / frame_rate) * max(segment.speed, 0.0),
+                preserve_alpha,
             )
             parts.append(part_path)
             cursor_frame += duration_frames
@@ -214,12 +230,16 @@ def _render_video_tracks(
         if project_frames - cursor_frame > 0:
             gap_path = temp_path / f"track_{track_index:03d}_tail.mov"
             tail_duration = (project_frames - cursor_frame) / frame_rate
-            _render_transparent_gap(gap_path, project, ffmpeg, tail_duration)
+            _render_transparent_gap(
+                gap_path, project, ffmpeg, tail_duration, preserve_alpha
+            )
             parts.append(gap_path)
 
         if parts:
             track_path = temp_path / f"track_{track_index:03d}.mov"
             _concat_track(parts, track_path, ffmpeg)
+            for part in parts:
+                part.unlink(missing_ok=True)
             rendered_tracks.append(track_path)
     return rendered_tracks
 
