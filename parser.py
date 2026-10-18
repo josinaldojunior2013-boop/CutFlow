@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -34,8 +34,12 @@ class TimelineSegment:
     speed: float
     media_id: str = ""
     media_name: str = ""
+    media_kind: str = ""
     track_name: str = ""
     enabled: bool = True
+    raw_path: str = ""
+    effects: tuple[str, ...] = ()
+    transitions: tuple[str, ...] = ()
 
 
 @dataclass
@@ -47,6 +51,13 @@ class TimelineProject:
     width: int
     height: int
     fps: float
+
+
+@dataclass(frozen=True)
+class RelinkSummary:
+    linked_materials: int
+    ambiguous_materials: int
+    missing_materials: int
 
 
 def _seconds(value: Any) -> float:
@@ -110,6 +121,7 @@ def extract_timeline(draft_path: str | Path) -> TimelineProject:
     if not isinstance(materials, dict):
         materials = {}
     media_by_id: dict[str, dict[str, Any]] = {}
+    references_by_id: dict[str, tuple[str, str]] = {}
     for material_group in ("videos", "audios"):
         for material in materials.get(material_group, []):
             material_id = material.get("id")
@@ -124,7 +136,21 @@ def extract_timeline(draft_path: str | Path) -> TimelineProject:
                     "name": material.get("material_name")
                     or material.get("name")
                     or (Path(material_path).name if material_path else material_id),
+                    "kind": material.get("type") or material_group,
                 }
+    for material_group, reference_type in (
+        ("video_effects", "effect"),
+        ("transitions", "transition"),
+    ):
+        for material in materials.get(material_group, []):
+            material_id = material.get("id")
+            if material_id:
+                reference_name = (
+                    material.get("name")
+                    or material.get("category_name")
+                    or reference_type
+                )
+                references_by_id[material_id] = (reference_type, reference_name)
 
     segments: list[TimelineSegment] = []
     for track_index, track in enumerate(draft.get("tracks", [])):
@@ -147,6 +173,19 @@ def extract_timeline(draft_path: str | Path) -> TimelineProject:
 
             source_range = segment.get("source_timerange") or {}
             target_range = segment.get("target_timerange") or {}
+            extra_material_refs = segment.get("extra_material_refs") or []
+            effects = tuple(
+                references_by_id[reference_id][1]
+                for reference_id in extra_material_refs
+                if reference_id in references_by_id
+                and references_by_id[reference_id][0] == "effect"
+            )
+            transitions = tuple(
+                references_by_id[reference_id][1]
+                for reference_id in extra_material_refs
+                if reference_id in references_by_id
+                and references_by_id[reference_id][0] == "transition"
+            )
             duration_seconds = _seconds(
                 target_range.get("duration") or source_range.get("duration")
             )
@@ -169,8 +208,12 @@ def extract_timeline(draft_path: str | Path) -> TimelineProject:
                     speed=float(segment.get("speed", 1.0) or 1.0),
                     media_id=material_id or "",
                     media_name=material.get("name") or material_id or "Mídia sem nome",
+                    media_kind=material.get("kind") or track_type,
                     track_name=track.get("name") or f"Faixa {track_index + 1}",
                     enabled=True,
+                    raw_path=material.get("path") or material_path or "",
+                    effects=effects,
+                    transitions=transitions,
                 )
             )
 
@@ -186,4 +229,79 @@ def extract_timeline(draft_path: str | Path) -> TimelineProject:
         width=int(canvas.get("width") or 1920),
         height=int(canvas.get("height") or 1080),
         fps=float(draft.get("fps") or 30.0),
+    )
+
+
+def relink_media_in_folder(
+    segments: list[TimelineSegment], media_folder: str | Path
+) -> tuple[list[TimelineSegment], RelinkSummary]:
+    """Relink missing media only when its exact name maps to one compatible file."""
+    media_folder = Path(media_folder).expanduser().resolve()
+    audio_suffixes = {".aac", ".flac", ".m4a", ".mp3", ".ogg", ".wav"}
+    supported_suffixes = audio_suffixes | {
+        ".avi",
+        ".bmp",
+        ".gif",
+        ".jpeg",
+        ".jpg",
+        ".m4v",
+        ".mkv",
+        ".mov",
+        ".mp4",
+        ".png",
+        ".tif",
+        ".tiff",
+        ".webm",
+        ".webp",
+    }
+    files_by_name: dict[str, set[Path]] = {}
+    for file_path in media_folder.rglob("*"):
+        if not file_path.is_file() or file_path.suffix.lower() not in supported_suffixes:
+            continue
+        file_path = file_path.resolve()
+        files_by_name.setdefault(file_path.name.casefold(), set()).add(file_path)
+        files_by_name.setdefault(file_path.stem.casefold(), set()).add(file_path)
+
+    paths_by_material: dict[str, Path] = {}
+    ambiguous_materials: set[str] = set()
+    missing_materials: set[str] = set()
+    for index, segment in enumerate(segments):
+        if segment.path is not None and segment.path.is_file():
+            continue
+        material_key = segment.media_id or f"segment:{index}"
+        if material_key in paths_by_material or material_key in ambiguous_materials:
+            continue
+
+        raw_name = Path(segment.raw_path.replace("\\", "/")).name if segment.raw_path else ""
+        media_name = Path(segment.media_name.replace("\\", "/")).name
+        names = {raw_name.casefold(), Path(raw_name).stem.casefold()}
+        names.update({media_name.casefold(), Path(media_name).stem.casefold()})
+        candidates = {
+            candidate
+            for name in names
+            if name
+            for candidate in files_by_name.get(name, set())
+            if (candidate.suffix.lower() in audio_suffixes)
+            == (segment.track_type == "audio")
+        }
+        if len(candidates) == 1:
+            paths_by_material[material_key] = next(iter(candidates))
+        elif len(candidates) > 1:
+            ambiguous_materials.add(material_key)
+        else:
+            missing_materials.add(material_key)
+
+    relinked_segments = [
+        replace(
+            segment,
+            path=paths_by_material.get(
+                segment.media_id or f"segment:{index}", segment.path
+            ),
+        )
+        for index, segment in enumerate(segments)
+    ]
+    return relinked_segments, RelinkSummary(
+        linked_materials=len(paths_by_material),
+        ambiguous_materials=len(ambiguous_materials),
+        missing_materials=len(missing_materials),
     )

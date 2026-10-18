@@ -13,7 +13,13 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
-from parser import TimelineProject, TimelineSegment, VideoCut, extract_timeline
+from parser import (
+    TimelineProject,
+    TimelineSegment,
+    VideoCut,
+    extract_timeline,
+    relink_media_in_folder,
+)
 
 
 class RenderProgress:
@@ -518,13 +524,14 @@ def launch_gui() -> None:
     progress_var = tk.IntVar(value=0)
     state: dict[str, Any] = {"project": None}
     state["draft_path"] = None
+    state["selected_segment"] = None
 
     container = ttk.Frame(root, padding=12)
     container.grid(row=0, column=0, sticky="nsew")
     root.rowconfigure(0, weight=1)
     root.columnconfigure(0, weight=1)
     container.columnconfigure(0, weight=1)
-    container.rowconfigure(2, weight=1)
+    container.rowconfigure(5, weight=1)
 
     project_bar = ttk.Frame(container)
     project_bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
@@ -548,8 +555,47 @@ def launch_gui() -> None:
     )
     choose_output_button.grid(row=0, column=2)
 
+    timeline_header = ttk.Frame(container)
+    timeline_header.grid(row=2, column=0, sticky="ew", pady=(2, 4))
+    ttk.Label(timeline_header, text="Timeline").pack(side="left", padx=(0, 10))
+    ttk.Button(
+        timeline_header, text="−", width=3, command=lambda: change_zoom(-1)
+    ).pack(side="left")
+    zoom_var = tk.IntVar(value=6)
+    zoom_scale = ttk.Scale(
+        timeline_header,
+        from_=1,
+        to=20,
+        orient="horizontal",
+        command=lambda value: set_zoom(value),
+        length=150,
+    )
+    zoom_scale.set(zoom_var.get())
+    zoom_scale.pack(side="left", padx=5)
+    ttk.Button(
+        timeline_header, text="+", width=3, command=lambda: change_zoom(1)
+    ).pack(side="left")
+    ttk.Label(
+        timeline_header,
+        text="E = efeito no draft · T = transição no draft · selecione um bloco para ver o clipe",
+    ).pack(side="left", padx=12)
+
+    timeline_canvas = tk.Canvas(
+        container,
+        height=158,
+        background="#20252c",
+        highlightthickness=1,
+        highlightbackground="#38414c",
+    )
+    timeline_canvas.grid(row=3, column=0, sticky="ew")
+    timeline_scrollbar = ttk.Scrollbar(
+        container, orient="horizontal", command=timeline_canvas.xview
+    )
+    timeline_scrollbar.grid(row=4, column=0, sticky="ew", pady=(0, 5))
+    timeline_canvas.configure(xscrollcommand=timeline_scrollbar.set)
+
     table_frame = ttk.Frame(container)
-    table_frame.grid(row=2, column=0, sticky="nsew")
+    table_frame.grid(row=5, column=0, sticky="nsew")
     table_frame.rowconfigure(0, weight=1)
     table_frame.columnconfigure(0, weight=1)
     columns = (
@@ -557,6 +603,8 @@ def launch_gui() -> None:
         "track",
         "kind",
         "media",
+        "effects",
+        "transitions",
         "status",
         "timeline",
         "duration",
@@ -570,6 +618,8 @@ def launch_gui() -> None:
         "track": ("Faixa", 155),
         "kind": ("Tipo", 80),
         "media": ("Mídia", 290),
+        "effects": ("Efeitos no draft", 190),
+        "transitions": ("Transições no draft", 190),
         "status": ("Arquivo", 120),
         "timeline": ("Início", 95),
         "duration": ("Duração", 95),
@@ -595,8 +645,8 @@ def launch_gui() -> None:
     horizontal_scroll.grid(row=1, column=0, sticky="ew")
 
     action_bar = ttk.Frame(container)
-    action_bar.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-    action_bar.columnconfigure(4, weight=1)
+    action_bar.grid(row=6, column=0, sticky="ew", pady=(8, 0))
+    action_bar.columnconfigure(5, weight=1)
     relink_button = ttk.Button(action_bar, text="Religar mídia...", command=lambda: relink_selected())
     relink_button.grid(row=0, column=0, padx=(0, 6))
     adjust_button = ttk.Button(action_bar, text="Ajustar clipe...", command=lambda: adjust_selected())
@@ -605,27 +655,146 @@ def launch_gui() -> None:
         action_bar, text="Ativar/ignorar faixa", command=lambda: toggle_selected_track()
     )
     toggle_track_button.grid(row=0, column=2, padx=(0, 6))
+    bulk_relink_button = ttk.Button(
+        action_bar,
+        text="Buscar pasta de mídia...",
+        command=lambda: bulk_relink_folder(),
+    )
+    bulk_relink_button.grid(row=0, column=3, padx=(0, 6))
     refresh_button = ttk.Button(action_bar, text="Recarregar", command=lambda: choose_project())
-    refresh_button.grid(row=0, column=3)
+    refresh_button.grid(row=0, column=4)
     render_button = ttk.Button(action_bar, text="Renderizar", command=lambda: start_render())
-    render_button.grid(row=0, column=4, sticky="e")
+    render_button.grid(row=0, column=5, sticky="e")
 
     progress_bar = ttk.Progressbar(
         container, variable=progress_var, maximum=100, mode="determinate"
     )
-    progress_bar.grid(row=4, column=0, sticky="ew", pady=(8, 4))
+    progress_bar.grid(row=7, column=0, sticky="ew", pady=(8, 4))
     ttk.Label(container, textvariable=status_var, anchor="w").grid(
-        row=5, column=0, sticky="ew"
+        row=8, column=0, sticky="ew"
     )
     ttk.Label(
         container,
         text="Renderiza vídeo, imagem e áudio. Alguns efeitos e transições do CapCut podem exigir ajustes manuais.",
         anchor="w",
-    ).grid(row=6, column=0, sticky="ew", pady=(5, 0))
+    ).grid(row=9, column=0, sticky="ew", pady=(5, 0))
 
     def format_time(seconds: float) -> str:
         minutes, seconds = divmod(max(seconds, 0.0), 60)
         return f"{int(minutes):02d}:{seconds:05.2f}"
+
+    def set_zoom(value: str) -> None:
+        zoom_var.set(max(1, int(float(value))))
+        draw_timeline()
+
+    def change_zoom(amount: int) -> None:
+        zoom_var.set(min(max(zoom_var.get() + amount, 1), 20))
+        zoom_scale.set(zoom_var.get())
+        draw_timeline()
+
+    def select_segment(index: int) -> None:
+        timeline_table.selection_set(str(index))
+        timeline_table.focus(str(index))
+        timeline_table.see(str(index))
+        state["selected_segment"] = index
+        draw_timeline()
+
+    def draw_timeline() -> None:
+        timeline_canvas.delete("all")
+        project = state["project"]
+        if project is None:
+            return
+        label_width = 150
+        lane_height = 25
+        lane_gap = 6
+        ruler_height = 22
+        scale = zoom_var.get()
+        visible_width = max(timeline_canvas.winfo_width(), 400)
+        timeline_width = max(project.duration * scale, visible_width - label_width)
+        total_width = label_width + timeline_width
+        lane_count = max((item.track_index for item in project.segments), default=-1) + 1
+        total_height = ruler_height + max(lane_count, 1) * (lane_height + lane_gap)
+        timeline_canvas.configure(scrollregion=(0, 0, total_width, total_height))
+
+        tick_interval = 60 if project.duration > 600 else 30 if project.duration > 180 else 10
+        tick = 0
+        while tick <= project.duration:
+            x = label_width + tick * scale
+            timeline_canvas.create_line(x, 0, x, total_height, fill="#3c4652")
+            timeline_canvas.create_text(
+                x + 3,
+                3,
+                text=format_time(tick),
+                fill="#c3ccd6",
+                anchor="nw",
+                font=("Segoe UI", 8),
+            )
+            tick += tick_interval
+
+        segments_by_track: dict[int, list[tuple[int, TimelineSegment]]] = {}
+        for index, segment in enumerate(project.segments):
+            segments_by_track.setdefault(segment.track_index, []).append((index, segment))
+
+        for track_index, track_segments in sorted(segments_by_track.items()):
+            y = ruler_height + track_index * (lane_height + lane_gap)
+            track_name = track_segments[0][1].track_name
+            timeline_canvas.create_text(
+                6,
+                y + lane_height / 2,
+                text=track_name[:20],
+                fill="#e1e7ed",
+                anchor="w",
+                font=("Segoe UI", 8),
+            )
+            for index, segment in track_segments:
+                x1 = label_width + segment.timeline_start * scale
+                x2 = max(x1 + 3, label_width + (segment.timeline_start + segment.duration) * scale)
+                missing = segment.path is None or not segment.path.is_file()
+                if not segment.enabled or missing:
+                    color = "#763d42" if missing else "#525b66"
+                elif segment.track_type == "audio":
+                    color = "#337c63"
+                elif segment.media_kind == "photo" or (
+                    segment.path is not None and _is_still_image(segment.path)
+                ):
+                    color = "#986f31"
+                else:
+                    color = "#3d6d9a"
+                selected = state["selected_segment"] == index
+                block = timeline_canvas.create_rectangle(
+                    x1,
+                    y,
+                    x2,
+                    y + lane_height,
+                    fill=color,
+                    outline="#f0c36d" if selected else color,
+                    width=2 if selected else 1,
+                )
+                if x2 - x1 > 35:
+                    markers = ("E" if segment.effects else "") + ("T" if segment.transitions else "")
+                    name = segment.media_name
+                    label = f"{name} [{markers}]" if markers else name
+                    timeline_canvas.create_text(
+                        x1 + 4,
+                        y + lane_height / 2,
+                        text=label,
+                        fill="white",
+                        anchor="w",
+                        font=("Segoe UI", 8),
+                        tags=(f"segment-{index}",),
+                    )
+                timeline_canvas.tag_bind(
+                    block,
+                    "<Button-1>",
+                    lambda _event, selected_index=index: select_segment(selected_index),
+                )
+                timeline_canvas.tag_bind(
+                    block,
+                    "<Double-1>",
+                    lambda _event, selected_index=index: (
+                        select_segment(selected_index), adjust_selected()
+                    ),
+                )
 
     def refresh_table() -> None:
         timeline_table.delete(*timeline_table.get_children())
@@ -650,8 +819,15 @@ def launch_gui() -> None:
                 values=(
                     "Sim" if segment.enabled else "Não",
                     segment.track_name,
-                    "Vídeo" if segment.track_type == "video" else "Áudio",
+                    "Áudio"
+                    if segment.track_type == "audio"
+                    else "Imagem"
+                    if segment.media_kind == "photo"
+                    or (segment.path is not None and _is_still_image(segment.path))
+                    else "Vídeo",
                     media_label,
+                    ", ".join(segment.effects) or "—",
+                    ", ".join(segment.transitions) or "—",
                     "OK" if file_exists else "Religar",
                     format_time(segment.timeline_start),
                     format_time(segment.duration),
@@ -674,6 +850,7 @@ def launch_gui() -> None:
             f"{active_missing_count}/{missing_count} mídia(s) ausentes · "
             f"{project.width}×{project.height} · {project.fps:g} FPS"
         )
+        draw_timeline()
 
     def choose_project() -> None:
         folder = filedialog.askdirectory(title="Selecione a pasta do projeto")
@@ -715,6 +892,10 @@ def launch_gui() -> None:
     def selected_index() -> int | None:
         selection = timeline_table.selection()
         return int(selection[0]) if selection else None
+
+    def highlight_table_selection(_event=None) -> None:
+        state["selected_segment"] = selected_index()
+        draw_timeline()
 
     def toggle_selected_track() -> None:
         index = selected_index()
@@ -760,6 +941,61 @@ def launch_gui() -> None:
             for item in project.segments
         ]
         refresh_table()
+
+    def bulk_relink_folder() -> None:
+        project = state["project"]
+        if project is None:
+            messagebox.showinfo("Projeto não aberto", "Abra um projeto antes de buscar mídias.", parent=root)
+            return
+        folder = filedialog.askdirectory(
+            title="Selecione a pasta que contém as mídias do projeto",
+            parent=root,
+        )
+        if not folder:
+            return
+        scan_controls = (
+            browse_project_button,
+            choose_output_button,
+            relink_button,
+            adjust_button,
+            toggle_track_button,
+            refresh_button,
+            render_button,
+            bulk_relink_button,
+        )
+        for control in scan_controls:
+            control.configure(state="disabled")
+        status_var.set("Procurando mídias por nome e caminho...")
+
+        def worker() -> None:
+            try:
+                segments, summary = relink_media_in_folder(project.segments, folder)
+                root.after(0, finish_bulk_relink, segments, summary, None)
+            except Exception as error:
+                root.after(0, finish_bulk_relink, None, None, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_bulk_relink(segments, summary, error) -> None:
+        for control in scan_controls:
+            control.configure(state="normal")
+        if error:
+            messagebox.showerror("Falha ao buscar mídias", str(error), parent=root)
+            refresh_table()
+            return
+        project = state["project"]
+        if project is None or segments is None or summary is None:
+            return
+        project.segments = segments
+        refresh_table()
+        messagebox.showinfo(
+            "Busca de mídias concluída",
+            f"Religadas: {summary.linked_materials} · "
+            f"Ambíguas: {summary.ambiguous_materials} · "
+            f"Não encontradas: {summary.missing_materials}\n\n"
+            "Revise as linhas marcadas como Religar manualmente.",
+            parent=root,
+        )
 
     def adjust_selected() -> None:
         index = selected_index()
@@ -831,6 +1067,7 @@ def launch_gui() -> None:
         relink_button.configure(state="normal")
         adjust_button.configure(state="normal")
         toggle_track_button.configure(state="normal")
+        bulk_relink_button.configure(state="normal")
         refresh_button.configure(state="normal")
         if error:
             refresh_table()
@@ -868,6 +1105,7 @@ def launch_gui() -> None:
         relink_button.configure(state="disabled")
         adjust_button.configure(state="disabled")
         toggle_track_button.configure(state="disabled")
+        bulk_relink_button.configure(state="disabled")
         refresh_button.configure(state="disabled")
         progress_var.set(0)
         status_var.set("Preparando renderização...")
@@ -885,6 +1123,7 @@ def launch_gui() -> None:
         threading.Thread(target=worker, daemon=True).start()
 
     timeline_table.bind("<Double-1>", lambda _event: adjust_selected())
+    timeline_table.bind("<<TreeviewSelect>>", highlight_table_selection)
     root.mainloop()
 
 
