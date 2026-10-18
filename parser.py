@@ -20,6 +20,31 @@ class VideoCut:
     duration: float
 
 
+@dataclass(frozen=True)
+class TimelineSegment:
+    """A media segment positioned on a CapCut timeline."""
+
+    path: Path
+    track_type: str
+    track_index: int
+    source_start: float
+    timeline_start: float
+    duration: float
+    volume: float
+    speed: float
+
+
+@dataclass(frozen=True)
+class TimelineProject:
+    """Renderable media and canvas settings from a CapCut draft."""
+
+    segments: list[TimelineSegment]
+    duration: float
+    width: int
+    height: int
+    fps: float
+
+
 def _seconds(value: Any) -> float:
     """Convert CapCut's integer microseconds to seconds."""
     return float(value or 0) / MICROSECONDS_PER_SECOND
@@ -62,46 +87,87 @@ def _resolve_media_path(raw_path: str, draft_dir: Path) -> Path:
 
 
 def extract_video_cuts(draft_path: str | Path) -> list[VideoCut]:
-    """Extract source paths and source time ranges from a CapCut draft."""
+    """Extract video ranges, retaining the original convenience API."""
+    project = extract_timeline(draft_path)
+    return [
+        VideoCut(segment.path, segment.source_start, segment.duration)
+        for segment in project.segments
+        if segment.track_type == "video"
+    ]
+
+
+def extract_timeline(draft_path: str | Path) -> TimelineProject:
+    """Extract media, timing, and canvas settings from a CapCut draft."""
     draft_path = Path(draft_path).expanduser().resolve()
     with draft_path.open("r", encoding="utf-8") as draft_file:
         draft = json.load(draft_file)
 
     materials = draft.get("materials", {})
-    videos = materials.get("videos", []) if isinstance(materials, dict) else []
-    video_paths = {
-        material.get("id"): material.get("path") or material.get("file_path")
-        for material in videos
-        if material.get("id")
-    }
+    if not isinstance(materials, dict):
+        materials = {}
+    media_by_id: dict[str, str] = {}
+    for material_group in ("videos", "audios"):
+        for material in materials.get(material_group, []):
+            material_id = material.get("id")
+            material_path = (
+                material.get("path")
+                or material.get("file_path")
+                or material.get("media_path")
+            )
+            if material_id and material_path:
+                media_by_id[material_id] = material_path
 
-    cuts: list[VideoCut] = []
-    for track in draft.get("tracks", []):
-        if track.get("type") not in (None, "video"):
+    segments: list[TimelineSegment] = []
+    for track_index, track in enumerate(draft.get("tracks", [])):
+        track_type = track.get("type")
+        if track_type not in {"video", "audio"}:
             continue
         for segment in track.get("segments", []):
+            if not segment.get("visible", True):
+                continue
             material_id = segment.get("material_id")
-            material_path = video_paths.get(material_id)
+            material_path = media_by_id.get(material_id)
             if not material_path:
                 material = segment.get("material", {})
-                material_path = material.get("path") or segment.get("file_path")
+                material_path = (
+                    material.get("path")
+                    or material.get("file_path")
+                    or segment.get("file_path")
+                )
             if not material_path:
                 continue
 
             source_range = segment.get("source_timerange") or {}
-            duration = source_range.get("duration")
-            if duration is None:
-                duration = (segment.get("target_timerange") or {}).get("duration", 0)
-            duration_seconds = _seconds(duration)
+            target_range = segment.get("target_timerange") or {}
+            duration_seconds = _seconds(
+                target_range.get("duration") or source_range.get("duration")
+            )
             if duration_seconds <= 0:
                 continue
 
-            cuts.append(
-                VideoCut(
+            segments.append(
+                TimelineSegment(
                     path=_resolve_media_path(material_path, draft_path.parent),
-                    start=_seconds(source_range.get("start", 0)),
+                    track_type=track_type,
+                    track_index=track_index,
+                    source_start=_seconds(source_range.get("start", 0)),
+                    timeline_start=_seconds(target_range.get("start", 0)),
                     duration=duration_seconds,
+                    volume=float(segment.get("volume", 1.0) or 0.0),
+                    speed=float(segment.get("speed", 1.0) or 1.0),
                 )
             )
 
-    return cuts
+    segments.sort(key=lambda item: (item.track_index, item.timeline_start))
+    canvas = draft.get("canvas_config") or {}
+    duration = _seconds(draft.get("duration"))
+    if duration <= 0 and segments:
+        duration = max(item.timeline_start + item.duration for item in segments)
+
+    return TimelineProject(
+        segments=segments,
+        duration=duration,
+        width=int(canvas.get("width") or 1920),
+        height=int(canvas.get("height") or 1080),
+        fps=float(draft.get("fps") or 30.0),
+    )
