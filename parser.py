@@ -24,7 +24,7 @@ class VideoCut:
 class TimelineSegment:
     """A media segment positioned on a CapCut timeline."""
 
-    path: Path
+    path: Path | None
     track_type: str
     track_index: int
     source_start: float
@@ -32,9 +32,13 @@ class TimelineSegment:
     duration: float
     volume: float
     speed: float
+    media_id: str = ""
+    media_name: str = ""
+    track_name: str = ""
+    enabled: bool = True
 
 
-@dataclass(frozen=True)
+@dataclass
 class TimelineProject:
     """Renderable media and canvas settings from a CapCut draft."""
 
@@ -92,7 +96,7 @@ def extract_video_cuts(draft_path: str | Path) -> list[VideoCut]:
     return [
         VideoCut(segment.path, segment.source_start, segment.duration)
         for segment in project.segments
-        if segment.track_type == "video"
+        if segment.track_type == "video" and segment.path is not None
     ]
 
 
@@ -105,7 +109,7 @@ def extract_timeline(draft_path: str | Path) -> TimelineProject:
     materials = draft.get("materials", {})
     if not isinstance(materials, dict):
         materials = {}
-    media_by_id: dict[str, str] = {}
+    media_by_id: dict[str, dict[str, Any]] = {}
     for material_group in ("videos", "audios"):
         for material in materials.get(material_group, []):
             material_id = material.get("id")
@@ -114,8 +118,13 @@ def extract_timeline(draft_path: str | Path) -> TimelineProject:
                 or material.get("file_path")
                 or material.get("media_path")
             )
-            if material_id and material_path:
-                media_by_id[material_id] = material_path
+            if material_id:
+                media_by_id[material_id] = {
+                    "path": material_path,
+                    "name": material.get("material_name")
+                    or material.get("name")
+                    or (Path(material_path).name if material_path else material_id),
+                }
 
     segments: list[TimelineSegment] = []
     for track_index, track in enumerate(draft.get("tracks", [])):
@@ -126,16 +135,15 @@ def extract_timeline(draft_path: str | Path) -> TimelineProject:
             if not segment.get("visible", True):
                 continue
             material_id = segment.get("material_id")
-            material_path = media_by_id.get(material_id)
+            material = media_by_id.get(material_id, {})
+            material_path = material.get("path")
             if not material_path:
-                material = segment.get("material", {})
+                segment_material = segment.get("material", {})
                 material_path = (
-                    material.get("path")
-                    or material.get("file_path")
+                    segment_material.get("path")
+                    or segment_material.get("file_path")
                     or segment.get("file_path")
                 )
-            if not material_path:
-                continue
 
             source_range = segment.get("source_timerange") or {}
             target_range = segment.get("target_timerange") or {}
@@ -147,7 +155,11 @@ def extract_timeline(draft_path: str | Path) -> TimelineProject:
 
             segments.append(
                 TimelineSegment(
-                    path=_resolve_media_path(material_path, draft_path.parent),
+                    path=(
+                        _resolve_media_path(material_path, draft_path.parent)
+                        if material_path
+                        else None
+                    ),
                     track_type=track_type,
                     track_index=track_index,
                     source_start=_seconds(source_range.get("start", 0)),
@@ -155,6 +167,10 @@ def extract_timeline(draft_path: str | Path) -> TimelineProject:
                     duration=duration_seconds,
                     volume=float(segment.get("volume", 1.0) or 0.0),
                     speed=float(segment.get("speed", 1.0) or 1.0),
+                    media_id=material_id or "",
+                    media_name=material.get("name") or material_id or "Mídia sem nome",
+                    track_name=track.get("name") or f"Faixa {track_index + 1}",
+                    enabled=True,
                 )
             )
 

@@ -3,27 +3,78 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from dataclasses import replace
 import shutil
 import subprocess
 import sys
 import threading
 import tempfile
 from pathlib import Path
+from typing import Any, Callable
 
 from parser import TimelineProject, TimelineSegment, VideoCut, extract_timeline
 
 
-def _run_ffmpeg(command: list[str]) -> None:
-    result = subprocess.run(
+class RenderProgress:
+    def __init__(self, total_work: float, callback: Callable[[int, str], None]):
+        self.total_work = max(total_work, 1e-9)
+        self.callback = callback
+        self.completed_work = 0.0
+
+    def run(self, command: list[str], label: str, duration: float) -> None:
+        duration = max(duration, 0.0)
+
+        def report(fraction: float) -> None:
+            work = self.completed_work + duration * min(max(fraction, 0.0), 1.0)
+            self.callback(min(int(work * 100 / self.total_work), 99), label)
+
+        _run_ffmpeg(command, report, duration)
+        self.completed_work += duration
+        self.callback(min(int(self.completed_work * 100 / self.total_work), 99), label)
+
+
+def _run_stage(
+    command: list[str],
+    progress: RenderProgress,
+    label: str,
+    duration: float,
+) -> None:
+    progress.run(command, label, duration)
+
+
+def _run_ffmpeg(
+    command: list[str],
+    progress_callback: Callable[[float], None] | None = None,
+    duration: float = 0.0,
+) -> None:
+    command = [*command, "-progress", "pipe:1"]
+    output = deque(maxlen=40)
+    process = subprocess.Popen(
         command,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
         encoding="utf-8",
         errors="replace",
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
-    if result.returncode:
-        message = result.stderr.strip() or f"FFmpeg terminou com código {result.returncode}."
+    if process.stdout is not None:
+        for line in process.stdout:
+            line = line.rstrip()
+            if line:
+                output.append(line)
+            if progress_callback and line.startswith("out_time_us=") and duration > 0:
+                try:
+                    current_time = float(line.partition("=")[2]) / 1_000_000
+                except ValueError:
+                    continue
+                progress_callback(current_time / duration)
+            elif progress_callback and line == "progress=end":
+                progress_callback(1.0)
+    return_code = process.wait()
+    if return_code:
+        message = "\n".join(output) or f"FFmpeg terminou com código {return_code}."
         raise RuntimeError(message)
 
 
@@ -48,7 +99,14 @@ STILL_IMAGE_SUFFIXES = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff"
 
 
 def _ffmpeg_base(ffmpeg: str) -> list[str]:
-    return [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats"]
+    return [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostats",
+    ]
 
 
 def _is_still_image(path: Path) -> bool:
@@ -67,6 +125,8 @@ def _render_transparent_segment(
     duration: float,
     source_start: float,
     preserve_alpha: bool,
+    progress: RenderProgress,
+    label: str,
 ) -> None:
     if not segment.path.is_file():
         raise FileNotFoundError(f"Arquivo de mídia não encontrado: {segment.path}")
@@ -107,7 +167,7 @@ def _render_transparent_segment(
             str(output_path),
         ]
     )
-    _run_ffmpeg(command)
+    _run_stage(command, progress, label, duration)
 
 
 def _render_transparent_gap(
@@ -116,13 +176,15 @@ def _render_transparent_gap(
     ffmpeg: str,
     duration: float,
     preserve_alpha: bool,
+    progress: RenderProgress,
+    label: str,
 ) -> None:
     pixel_format = "argb" if preserve_alpha else "yuv420p"
     color = "black@0.0" if preserve_alpha else "black"
     pixel_filter = "rgba" if preserve_alpha else "yuv420p"
     video_codec = "qtrle" if preserve_alpha else "libx264"
     encoder_args = ["-preset", "ultrafast", "-crf", "20"] if not preserve_alpha else []
-    _run_ffmpeg(
+    _run_stage(
         _ffmpeg_base(ffmpeg)
         + [
             "-f",
@@ -136,18 +198,28 @@ def _render_transparent_gap(
             "-pix_fmt",
             pixel_format,
             str(output_path),
-        ]
+        ],
+        progress,
+        label,
+        duration,
     )
 
 
-def _concat_track(parts: list[Path], output_path: Path, ffmpeg: str) -> None:
+def _concat_track(
+    parts: list[Path],
+    output_path: Path,
+    ffmpeg: str,
+    progress: RenderProgress,
+    duration: float,
+    label: str,
+) -> None:
     concat_file = output_path.with_suffix(".txt")
     entries = []
     for part in parts:
         escaped_path = part.resolve().as_posix().replace("'", "'\\''")
         entries.append(f"file '{escaped_path}'\n")
     concat_file.write_text("".join(entries), encoding="utf-8")
-    _run_ffmpeg(
+    _run_stage(
         _ffmpeg_base(ffmpeg)
         + [
             "-f",
@@ -160,17 +232,23 @@ def _concat_track(parts: list[Path], output_path: Path, ffmpeg: str) -> None:
             "-c:v",
             "copy",
             str(output_path),
-        ]
+        ],
+        progress,
+        label,
+        duration,
     )
     concat_file.unlink(missing_ok=True)
 
 
 def _render_video_tracks(
-    project: TimelineProject, temp_path: Path, ffmpeg: str
+    project: TimelineProject,
+    temp_path: Path,
+    ffmpeg: str,
+    progress: RenderProgress,
 ) -> list[Path]:
     video_tracks: dict[int, list[TimelineSegment]] = {}
     for segment in project.segments:
-        if segment.track_type == "video":
+        if segment.enabled and segment.track_type == "video":
             video_tracks.setdefault(segment.track_index, []).append(segment)
 
     rendered_tracks: list[Path] = []
@@ -195,7 +273,13 @@ def _render_video_tracks(
                 gap_path = temp_path / f"track_{track_index:03d}_gap_{index:05d}.mov"
                 gap_duration = (start_frame - cursor_frame) / frame_rate
                 _render_transparent_gap(
-                    gap_path, project, ffmpeg, gap_duration, preserve_alpha
+                    gap_path,
+                    project,
+                    ffmpeg,
+                    gap_duration,
+                    preserve_alpha,
+                    progress,
+                    f"Gerando vazio da faixa {track_index + 1}",
                 )
                 parts.append(gap_path)
                 cursor_frame = start_frame
@@ -223,6 +307,8 @@ def _render_video_tracks(
                 segment.source_start
                 + (overlap_frames / frame_rate) * max(segment.speed, 0.0),
                 preserve_alpha,
+                progress,
+                f"Renderizando faixa {track_index + 1}, clipe {index + 1}",
             )
             parts.append(part_path)
             cursor_frame += duration_frames
@@ -231,13 +317,26 @@ def _render_video_tracks(
             gap_path = temp_path / f"track_{track_index:03d}_tail.mov"
             tail_duration = (project_frames - cursor_frame) / frame_rate
             _render_transparent_gap(
-                gap_path, project, ffmpeg, tail_duration, preserve_alpha
+                gap_path,
+                project,
+                ffmpeg,
+                tail_duration,
+                preserve_alpha,
+                progress,
+                f"Finalizando faixa {track_index + 1}",
             )
             parts.append(gap_path)
 
         if parts:
             track_path = temp_path / f"track_{track_index:03d}.mov"
-            _concat_track(parts, track_path, ffmpeg)
+            _concat_track(
+                parts,
+                track_path,
+                ffmpeg,
+                progress,
+                project.duration,
+                f"Montando faixa {track_index + 1}",
+            )
             for part in parts:
                 part.unlink(missing_ok=True)
             rendered_tracks.append(track_path)
@@ -267,13 +366,25 @@ def _render_audio_inputs(
 
 
 def render_timeline(
-    project: TimelineProject, output_path: str | Path, ffmpeg: str | None = None
+    project: TimelineProject,
+    output_path: str | Path,
+    ffmpeg: str | None = None,
+    progress_callback: Callable[[int, str], None] | None = None,
 ) -> Path:
     """Compose timed video and audio tracks into an MP4 using CPU encoding."""
     if project.duration <= 0:
         raise ValueError("O rascunho não informa uma duração de timeline válida.")
-    if not any(item.track_type == "video" for item in project.segments):
+    active_segments = [item for item in project.segments if item.enabled]
+    if not any(item.track_type == "video" and item.path is not None for item in active_segments):
         raise ValueError("Nenhuma mídia visual válida foi encontrada no rascunho.")
+    missing_segments = [
+        item for item in active_segments if item.path is None or not item.path.is_file()
+    ]
+    if missing_segments:
+        raise FileNotFoundError(
+            f"Mídia ausente na faixa {missing_segments[0].track_name}: "
+            f"{missing_segments[0].media_name}"
+        )
 
     ffmpeg = resolve_ffmpeg(ffmpeg)
     output_path = Path(output_path).expanduser().resolve()
@@ -281,20 +392,31 @@ def render_timeline(
     width = project.width + project.width % 2
     height = project.height + project.height % 2
     project = TimelineProject(
-        segments=project.segments,
+        segments=active_segments,
         duration=project.duration,
         width=width,
         height=height,
         fps=project.fps,
     )
 
+    video_track_count = len(
+        {item.track_index for item in project.segments if item.track_type == "video"}
+    )
+    progress = RenderProgress(
+        project.duration * (video_track_count * 2 + 1),
+        progress_callback or (lambda percent, label: None),
+    )
     with tempfile.TemporaryDirectory(prefix="capcut-light-") as temp_dir:
         temp_path = Path(temp_dir)
-        video_tracks = _render_video_tracks(project, temp_path, ffmpeg)
+        video_tracks = _render_video_tracks(project, temp_path, ffmpeg, progress)
         if not video_tracks:
             raise ValueError("Nenhuma trilha de vídeo pôde ser renderizada.")
 
-        audio_segments = [item for item in project.segments if item.track_type == "audio"]
+        audio_segments = [
+            item
+            for item in project.segments
+            if item.enabled and item.track_type == "audio"
+        ]
         command = _ffmpeg_base(ffmpeg)
         for track_path in video_tracks:
             command.extend(["-i", str(track_path)])
@@ -360,8 +482,9 @@ def render_timeline(
                 str(output_path),
             ]
         )
-        _run_ffmpeg(command)
+        _run_stage(command, progress, "Compondo faixas e áudio", project.duration)
 
+    progress.callback(100, "Renderização concluída")
     return output_path
 
 
@@ -386,11 +509,171 @@ def launch_gui() -> None:
 
     root = tk.Tk()
     root.title("CapCut Light Renderer")
-    root.resizable(False, False)
+    root.geometry("1180x720")
+    root.minsize(900, 560)
 
-    project_var = tk.StringVar()
+    project_var = tk.StringVar(value="Nenhum projeto selecionado")
     output_var = tk.StringVar()
     status_var = tk.StringVar(value="Selecione a pasta do projeto CapCut.")
+    progress_var = tk.IntVar(value=0)
+    state: dict[str, Any] = {"project": None}
+    state["draft_path"] = None
+
+    container = ttk.Frame(root, padding=12)
+    container.grid(row=0, column=0, sticky="nsew")
+    root.rowconfigure(0, weight=1)
+    root.columnconfigure(0, weight=1)
+    container.columnconfigure(0, weight=1)
+    container.rowconfigure(2, weight=1)
+
+    project_bar = ttk.Frame(container)
+    project_bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+    project_bar.columnconfigure(1, weight=1)
+    ttk.Label(project_bar, text="Projeto").grid(row=0, column=0, padx=(0, 8))
+    ttk.Entry(project_bar, textvariable=project_var, state="readonly").grid(
+        row=0, column=1, sticky="ew", padx=(0, 8)
+    )
+    browse_project_button = ttk.Button(project_bar, text="Abrir pasta...", command=lambda: choose_project())
+    browse_project_button.grid(row=0, column=2)
+
+    output_bar = ttk.Frame(container)
+    output_bar.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+    output_bar.columnconfigure(1, weight=1)
+    ttk.Label(output_bar, text="Saída").grid(row=0, column=0, padx=(0, 8))
+    ttk.Entry(output_bar, textvariable=output_var).grid(
+        row=0, column=1, sticky="ew", padx=(0, 8)
+    )
+    choose_output_button = ttk.Button(
+        output_bar, text="Salvar como...", command=lambda: choose_output()
+    )
+    choose_output_button.grid(row=0, column=2)
+
+    table_frame = ttk.Frame(container)
+    table_frame.grid(row=2, column=0, sticky="nsew")
+    table_frame.rowconfigure(0, weight=1)
+    table_frame.columnconfigure(0, weight=1)
+    columns = (
+        "active",
+        "track",
+        "kind",
+        "media",
+        "status",
+        "timeline",
+        "duration",
+        "source",
+    )
+    timeline_table = ttk.Treeview(
+        table_frame, columns=columns, show="headings", selectmode="browse"
+    )
+    headings = {
+        "active": ("Usar", 58),
+        "track": ("Faixa", 155),
+        "kind": ("Tipo", 80),
+        "media": ("Mídia", 290),
+        "status": ("Arquivo", 120),
+        "timeline": ("Início", 95),
+        "duration": ("Duração", 95),
+        "source": ("Início na fonte", 115),
+    }
+    for column, (label, width) in headings.items():
+        timeline_table.heading(column, text=label)
+        timeline_table.column(column, width=width, minwidth=65, stretch=column == "media")
+    timeline_table.tag_configure("missing", foreground="#b42318")
+    timeline_table.tag_configure("ready", foreground="#18794e")
+    vertical_scroll = ttk.Scrollbar(
+        table_frame, orient="vertical", command=timeline_table.yview
+    )
+    horizontal_scroll = ttk.Scrollbar(
+        table_frame, orient="horizontal", command=timeline_table.xview
+    )
+    timeline_table.configure(
+        yscrollcommand=vertical_scroll.set,
+        xscrollcommand=horizontal_scroll.set,
+    )
+    timeline_table.grid(row=0, column=0, sticky="nsew")
+    vertical_scroll.grid(row=0, column=1, sticky="ns")
+    horizontal_scroll.grid(row=1, column=0, sticky="ew")
+
+    action_bar = ttk.Frame(container)
+    action_bar.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+    action_bar.columnconfigure(4, weight=1)
+    relink_button = ttk.Button(action_bar, text="Religar mídia...", command=lambda: relink_selected())
+    relink_button.grid(row=0, column=0, padx=(0, 6))
+    adjust_button = ttk.Button(action_bar, text="Ajustar clipe...", command=lambda: adjust_selected())
+    adjust_button.grid(row=0, column=1, padx=(0, 6))
+    toggle_track_button = ttk.Button(
+        action_bar, text="Ativar/ignorar faixa", command=lambda: toggle_selected_track()
+    )
+    toggle_track_button.grid(row=0, column=2, padx=(0, 6))
+    refresh_button = ttk.Button(action_bar, text="Recarregar", command=lambda: choose_project())
+    refresh_button.grid(row=0, column=3)
+    render_button = ttk.Button(action_bar, text="Renderizar", command=lambda: start_render())
+    render_button.grid(row=0, column=4, sticky="e")
+
+    progress_bar = ttk.Progressbar(
+        container, variable=progress_var, maximum=100, mode="determinate"
+    )
+    progress_bar.grid(row=4, column=0, sticky="ew", pady=(8, 4))
+    ttk.Label(container, textvariable=status_var, anchor="w").grid(
+        row=5, column=0, sticky="ew"
+    )
+    ttk.Label(
+        container,
+        text="Renderiza vídeo, imagem e áudio. Alguns efeitos e transições do CapCut podem exigir ajustes manuais.",
+        anchor="w",
+    ).grid(row=6, column=0, sticky="ew", pady=(5, 0))
+
+    def format_time(seconds: float) -> str:
+        minutes, seconds = divmod(max(seconds, 0.0), 60)
+        return f"{int(minutes):02d}:{seconds:05.2f}"
+
+    def refresh_table() -> None:
+        timeline_table.delete(*timeline_table.get_children())
+        project = state["project"]
+        if project is None:
+            return
+        missing_count = 0
+        active_missing_count = 0
+        for index, segment in enumerate(project.segments):
+            file_exists = segment.path is not None and segment.path.is_file()
+            if not file_exists:
+                missing_count += 1
+                if segment.enabled:
+                    active_missing_count += 1
+            media_label = (
+                segment.path.name if segment.path is not None else segment.media_name
+            )
+            timeline_table.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(
+                    "Sim" if segment.enabled else "Não",
+                    segment.track_name,
+                    "Vídeo" if segment.track_type == "video" else "Áudio",
+                    media_label,
+                    "OK" if file_exists else "Religar",
+                    format_time(segment.timeline_start),
+                    format_time(segment.duration),
+                    format_time(segment.source_start),
+                ),
+                tags=("ready" if file_exists else "missing",),
+            )
+        has_active_video = any(
+            item.enabled and item.track_type == "video" and item.path is not None
+            for item in project.segments
+        )
+        render_button.configure(
+            state="normal" if active_missing_count == 0 and has_active_video else "disabled"
+        )
+        active_tracks = len(
+            {item.track_index for item in project.segments if item.enabled}
+        )
+        status_var.set(
+            f"{len(project.segments)} clipes · {active_tracks} faixas ativas · "
+            f"{active_missing_count}/{missing_count} mídia(s) ausentes · "
+            f"{project.width}×{project.height} · {project.fps:g} FPS"
+        )
 
     def choose_project() -> None:
         folder = filedialog.askdirectory(title="Selecione a pasta do projeto")
@@ -404,78 +687,204 @@ def launch_gui() -> None:
                 parent=root,
             )
             return
-        project_var.set(str(draft_file))
-        output_var.set(str(Path(folder) / "CapCutLightRenderer.mp4"))
-        status_var.set("Projeto carregado. Pronto para renderizar.")
+        try:
+            project = extract_timeline(draft_file)
+        except Exception as error:
+            messagebox.showerror(
+                "Não foi possível abrir o projeto", str(error), parent=root
+            )
+            return
+        state["project"] = project
+        state["draft_path"] = draft_file
+        project_var.set(str(folder))
+        progress_var.set(0)
+        refresh_table()
 
     def choose_output() -> None:
+        folder = Path(state["draft_path"]).parent if state["draft_path"] else Path.cwd()
         output = filedialog.asksaveasfilename(
             title="Salvar vídeo renderizado",
             defaultextension=".mp4",
             filetypes=[("Vídeo MP4", "*.mp4")],
+            initialdir=str(folder),
             initialfile="CapCutLightRenderer.mp4",
         )
         if output:
             output_var.set(output)
 
+    def selected_index() -> int | None:
+        selection = timeline_table.selection()
+        return int(selection[0]) if selection else None
+
+    def toggle_selected_track() -> None:
+        index = selected_index()
+        project = state["project"]
+        if index is None or project is None:
+            messagebox.showinfo(
+                "Selecione uma faixa",
+                "Selecione uma linha da faixa primeiro.",
+                parent=root,
+            )
+            return
+        track_index = project.segments[index].track_index
+        enabled = not project.segments[index].enabled
+        project.segments = [
+            replace(item, enabled=enabled) if item.track_index == track_index else item
+            for item in project.segments
+        ]
+        refresh_table()
+
+    def relink_selected() -> None:
+        index = selected_index()
+        project = state["project"]
+        if index is None or project is None:
+            messagebox.showinfo("Selecione uma mídia", "Selecione uma linha da tabela primeiro.", parent=root)
+            return
+        segment = project.segments[index]
+        file_path = filedialog.askopenfilename(
+            title=f"Selecione a mídia: {segment.media_name}",
+            filetypes=[
+                ("Mídias de vídeo, áudio e imagem", "*.mp4 *.mov *.mkv *.avi *.webm *.mp3 *.wav *.m4a *.aac *.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff"),
+                ("Todos os arquivos", "*.*"),
+            ],
+            parent=root,
+        )
+        if not file_path:
+            return
+        selected_path = Path(file_path).resolve()
+        project.segments = [
+            replace(item, path=selected_path)
+            if (segment.media_id and item.media_id == segment.media_id)
+            or item is segment
+            else item
+            for item in project.segments
+        ]
+        refresh_table()
+
+    def adjust_selected() -> None:
+        index = selected_index()
+        project = state["project"]
+        if index is None or project is None:
+            messagebox.showinfo("Selecione um clipe", "Selecione uma linha da tabela primeiro.", parent=root)
+            return
+        segment = project.segments[index]
+        dialog = tk.Toplevel(root)
+        dialog.title("Ajustar clipe")
+        dialog.transient(root)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        fields = {
+            "Início na timeline (s)": tk.StringVar(value=str(segment.timeline_start)),
+            "Duração (s)": tk.StringVar(value=str(segment.duration)),
+            "Início na fonte (s)": tk.StringVar(value=str(segment.source_start)),
+            "Volume (0–2)": tk.StringVar(value=str(segment.volume)),
+        }
+        for row, (label, variable) in enumerate(fields.items()):
+            ttk.Label(dialog, text=label).grid(row=row, column=0, sticky="w", padx=12, pady=6)
+            ttk.Entry(dialog, textvariable=variable, width=24).grid(
+                row=row, column=1, sticky="ew", padx=(0, 12), pady=6
+            )
+
+        def save_adjustment() -> None:
+            try:
+                timeline_start = float(fields["Início na timeline (s)"].get())
+                duration = float(fields["Duração (s)"].get())
+                source_start = float(fields["Início na fonte (s)"].get())
+                volume = float(fields["Volume (0–2)"].get())
+                if (
+                    timeline_start < 0
+                    or source_start < 0
+                    or duration <= 0
+                    or not 0 <= volume <= 2
+                ):
+                    raise ValueError(
+                        "Use inícios não negativos, duração maior que zero e volume entre 0 e 2."
+                    )
+            except ValueError as error:
+                messagebox.showerror("Valores inválidos", str(error), parent=dialog)
+                return
+            project.segments[index] = replace(
+                segment,
+                timeline_start=timeline_start,
+                duration=duration,
+                source_start=source_start,
+                volume=volume,
+            )
+            project.duration = max(project.duration, timeline_start + duration)
+            project.segments.sort(key=lambda item: (item.track_index, item.timeline_start))
+            refresh_table()
+            dialog.destroy()
+
+        controls = ttk.Frame(dialog, padding=(12, 4, 12, 12))
+        controls.grid(row=len(fields), column=0, columnspan=2, sticky="e")
+        ttk.Button(controls, text="Cancelar", command=dialog.destroy).grid(row=0, column=0, padx=4)
+        ttk.Button(controls, text="Aplicar", command=save_adjustment).grid(row=0, column=1, padx=4)
+
+    def set_progress(percent: int, label: str) -> None:
+        progress_var.set(percent)
+        status_var.set(f"{percent}% · {label}")
+
     def finish_render(output: Path | None, error: Exception | None) -> None:
         render_button.configure(state="normal")
+        browse_project_button.configure(state="normal")
+        choose_output_button.configure(state="normal")
+        relink_button.configure(state="normal")
+        adjust_button.configure(state="normal")
+        toggle_track_button.configure(state="normal")
+        refresh_button.configure(state="normal")
         if error:
-            status_var.set("Falha na renderização.")
+            refresh_table()
+            status_var.set("Renderização falhou; consulte as mídias e o erro.")
             messagebox.showerror("Erro ao renderizar", str(error), parent=root)
             return
-        status_var.set(f"Concluído: {output}")
+        progress_var.set(100)
+        status_var.set(f"100% · Renderização concluída: {output}")
         messagebox.showinfo("Renderização concluída", f"Vídeo salvo em:\n{output}", parent=root)
 
     def start_render() -> None:
-        draft_file = Path(project_var.get())
-        output_file = Path(output_var.get())
-        if not draft_file.is_file():
-            messagebox.showerror("Projeto inválido", "Selecione uma pasta de projeto válida.", parent=root)
+        project = state["project"]
+        if project is None:
+            messagebox.showerror("Projeto inválido", "Abra uma pasta de projeto primeiro.", parent=root)
             return
         if not output_var.get().strip():
             messagebox.showerror("Saída inválida", "Escolha onde salvar o vídeo.", parent=root)
             return
+        active_segments = [item for item in project.segments if item.enabled]
+        missing = [
+            item for item in active_segments if item.path is None or not item.path.is_file()
+        ]
+        if missing:
+            messagebox.showerror(
+                "Mídias pendentes",
+                f"Há {len(missing)} clipe(s) sem arquivo. Selecione cada linha marcada como Religar antes de renderizar.",
+                parent=root,
+            )
+            return
 
+        output_file = Path(output_var.get())
         render_button.configure(state="disabled")
-        status_var.set("Renderizando com CPU. Isso pode levar alguns minutos...")
+        browse_project_button.configure(state="disabled")
+        choose_output_button.configure(state="disabled")
+        relink_button.configure(state="disabled")
+        adjust_button.configure(state="disabled")
+        toggle_track_button.configure(state="disabled")
+        refresh_button.configure(state="disabled")
+        progress_var.set(0)
+        status_var.set("Preparando renderização...")
+
+        def report_progress(percent: int, label: str) -> None:
+            root.after(0, lambda value=percent, text=label: set_progress(value, text))
 
         def worker() -> None:
             try:
-                project = extract_timeline(draft_file)
-                result = render_timeline(project, output_file)
+                result = render_timeline(project, output_file, progress_callback=report_progress)
                 root.after(0, finish_render, result, None)
             except Exception as error:
                 root.after(0, finish_render, None, error)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    frame = ttk.Frame(root, padding=18)
-    frame.grid(sticky="nsew")
-    ttk.Label(frame, text="Pasta do projeto CapCut").grid(row=0, column=0, sticky="w")
-    ttk.Entry(frame, textvariable=project_var, width=58, state="readonly").grid(
-        row=1, column=0, padx=(0, 8), pady=(5, 12)
-    )
-    ttk.Button(frame, text="Selecionar pasta...", command=choose_project).grid(
-        row=1, column=1, pady=(5, 12)
-    )
-    ttk.Label(frame, text="Arquivo MP4 de saída").grid(row=2, column=0, sticky="w")
-    ttk.Entry(frame, textvariable=output_var, width=58).grid(
-        row=3, column=0, padx=(0, 8), pady=(5, 14)
-    )
-    ttk.Button(frame, text="Escolher...", command=choose_output).grid(
-        row=3, column=1, pady=(5, 14)
-    )
-    render_button = ttk.Button(frame, text="Renderizar", command=start_render)
-    render_button.grid(row=4, column=0, sticky="w")
-    ttk.Label(frame, textvariable=status_var, wraplength=470).grid(
-        row=5, column=0, columnspan=2, sticky="w", pady=(14, 0)
-    )
-    ttk.Label(
-        frame,
-        text="Renderiza trilhas de vídeo, imagens e áudio. Efeitos, textos e transições do CapCut podem não ser aplicados.",
-        wraplength=470,
-    ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(10, 0))
+    timeline_table.bind("<Double-1>", lambda _event: adjust_selected())
     root.mainloop()
 
 

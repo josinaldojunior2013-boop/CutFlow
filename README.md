@@ -4,9 +4,9 @@ Aplicativo Windows para renderizar a timeline de um projeto CapCut usando a CPU 
 
 ## Uso
 
-Abra `CapCutLightRenderer.exe`, selecione a pasta do projeto que contém `draft_content.json` e clique em **Renderizar**. Por padrão, o MP4 é salvo nessa pasta. Mantenha os arquivos de mídia do projeto acessíveis nos caminhos registrados no rascunho.
+Abra `CapCutLightRenderer.exe` e selecione a pasta do projeto que contém `draft_content.json`. A tabela lista clipes, faixas, início, duração e disponibilidade das mídias. Selecione uma linha para religar um arquivo, ajustar início/duração/trim/volume ou ativar/ignorar a faixa inteira. A barra de progresso acompanha o tempo reportado pelo FFmpeg. Por padrão, o MP4 é salvo na pasta do projeto.
 
-O renderer lê as trilhas e posições do próprio `draft_content.json`, combina vídeos e imagens no canvas do projeto e sincroniza as faixas de áudio. Os arquivos da pasta `Resources` precisam continuar acessíveis. Efeitos, textos, máscaras, animações e transições específicas do CapCut ainda podem não ser reproduzidos; valide cada projeto antes de usar o resultado final.
+O renderer lê as trilhas e posições do próprio `draft_content.json`, combina vídeos e imagens no canvas do projeto e sincroniza as faixas de áudio. Mídias ausentes em faixas ativas bloqueiam a renderização até serem religadas ou a faixa ser ignorada. Os arquivos da pasta `Resources` precisam continuar acessíveis. Efeitos, textos, máscaras, animações e transições específicas do CapCut ainda podem não ser reproduzidos; valide cada projeto antes de usar o resultado final.
 
 ## Build Windows
 
