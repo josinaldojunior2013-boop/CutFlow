@@ -45,6 +45,7 @@ def resolve_ffmpeg(ffmpeg: str | None) -> str:
 
 
 STILL_IMAGE_SUFFIXES = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+TIMELINE_EPSILON = 1e-9
 
 
 def _ffmpeg_base(ffmpeg: str) -> list[str]:
@@ -165,7 +166,9 @@ def _render_video_tracks(
         ordered_segments = sorted(segments, key=lambda item: item.timeline_start)
         for index, segment in enumerate(ordered_segments):
             start = max(segment.timeline_start, 0.0)
-            if start > cursor:
+            if abs(start - cursor) <= TIMELINE_EPSILON:
+                cursor = start
+            elif start > cursor:
                 gap_path = temp_path / f"track_{track_index:03d}_gap_{index:05d}.mov"
                 _render_transparent_gap(gap_path, project, ffmpeg, start - cursor)
                 parts.append(gap_path)
@@ -176,7 +179,7 @@ def _render_video_tracks(
             if index + 1 < len(ordered_segments):
                 next_start = ordered_segments[index + 1].timeline_start
                 duration = min(duration, max(next_start - cursor, 0.0))
-            if duration <= 0:
+            if duration <= TIMELINE_EPSILON:
                 continue
 
             part_path = temp_path / f"track_{track_index:03d}_clip_{index:05d}.mov"
@@ -191,7 +194,7 @@ def _render_video_tracks(
             parts.append(part_path)
             cursor += duration
 
-        if cursor < project.duration:
+        if project.duration - cursor > TIMELINE_EPSILON:
             gap_path = temp_path / f"track_{track_index:03d}_tail.mov"
             _render_transparent_gap(gap_path, project, ffmpeg, project.duration - cursor)
             parts.append(gap_path)
