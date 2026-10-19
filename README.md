@@ -8,6 +8,14 @@ Abra `CapCutLightRenderer.exe` e selecione a pasta do projeto que contém `draft
 
 O renderer lê as trilhas e posições do próprio `draft_content.json`, combina vídeos e imagens no canvas do projeto e sincroniza as faixas de áudio. Mídias ausentes em faixas ativas bloqueiam a renderização até serem religadas ou a faixa ser ignorada. Os arquivos da pasta `Resources` precisam continuar acessíveis. Efeitos, textos, máscaras, animações e transições específicas do CapCut ainda podem não ser reproduzidos; valide cada projeto antes de usar o resultado final.
 
+Clipes sem caminho próprio na faixa **Panel Shadow** são associados à imagem da faixa de painéis quando ocupam o mesmo intervalo da timeline. Assim, recursos de sombra internos do CapCut não são tratados como arquivos externos ausentes; a aparência exata da sombra pode variar no vídeo renderizado.
+
+## Converter projeto para Filmora 13
+
+Abra a pasta do projeto CapCut e religue todas as mídias ausentes. Clique em **Exportar Filmora 13...** e salve o `.wfp`; depois abra esse arquivo no Filmora. O exportador usa o modelo nativo Filmora 13 incluído no aplicativo, mantendo as posições e durações dos clipes, as faixas de áudio e os cortes. As transições do CapCut são substituídas pela transição **Fade Grayscale** do modelo Filmora e podem ter aparência diferente. Efeitos de vídeo, máscaras e animações por keyframes que não existam no modelo Filmora não são transferidos; o aplicativo informa essas limitações ao terminar.
+
+O `.wfp` referencia as mídias nos caminhos atuais (incluindo os caminhos religados); ele não copia os vídeos e áudios para dentro do projeto. Mantenha os arquivos acessíveis nesses caminhos ao abrir e renderizar no Filmora.
+
 ## Build Windows
 
 Em Windows com Python 3.12 ou superior:

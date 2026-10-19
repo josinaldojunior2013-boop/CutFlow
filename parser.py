@@ -3,12 +3,24 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from threading import Event
+from typing import Any, Callable
 
 
 MICROSECONDS_PER_SECOND = 1_000_000
+PANEL_IMAGE_SUFFIXES = {
+    ".bmp",
+    ".gif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".tif",
+    ".tiff",
+    ".webp",
+}
 
 
 @dataclass(frozen=True)
@@ -60,6 +72,10 @@ class RelinkSummary:
     missing_materials: int
 
 
+class RelinkCancelledError(RuntimeError):
+    """Raised when the user cancels a folder media scan."""
+
+
 def _seconds(value: Any) -> float:
     """Convert CapCut's integer microseconds to seconds."""
     return float(value or 0) / MICROSECONDS_PER_SECOND
@@ -99,6 +115,67 @@ def _resolve_media_path(raw_path: str, draft_dir: Path) -> Path:
         if len(matches) == 1:
             return matches[0].resolve()
     return media_path.resolve()
+
+
+def _is_source_less_panel_shadow(segment: TimelineSegment) -> bool:
+    if segment.raw_path:
+        return False
+    track_name = segment.track_name.casefold()
+    media_name = segment.media_name.casefold()
+    return (
+        "panel shadow" in track_name
+        or "painel sombra" in track_name
+        or "painel sombra" in media_name
+    )
+
+
+def _is_panel_image(segment: TimelineSegment) -> bool:
+    return (
+        segment.media_kind.casefold() in {"photo", "image"}
+        or Path(segment.raw_path).suffix.casefold() in PANEL_IMAGE_SUFFIXES
+        or (
+            segment.path is not None
+            and segment.path.suffix.casefold() in PANEL_IMAGE_SUFFIXES
+        )
+    )
+
+
+def link_panel_shadows(segments: list[TimelineSegment]) -> list[TimelineSegment]:
+    panels_by_range: dict[tuple[int, int], list[TimelineSegment]] = {}
+    for segment in segments:
+        if (
+            segment.track_type != "video"
+            or _is_source_less_panel_shadow(segment)
+            or not _is_panel_image(segment)
+        ):
+            continue
+        time_range = (
+            round(segment.timeline_start * MICROSECONDS_PER_SECOND),
+            round(segment.duration * MICROSECONDS_PER_SECOND),
+        )
+        panels_by_range.setdefault(time_range, []).append(segment)
+
+    linked_segments: list[TimelineSegment] = []
+    for segment in segments:
+        if not _is_source_less_panel_shadow(segment):
+            linked_segments.append(segment)
+            continue
+        if segment.path is not None and segment.path.is_file():
+            linked_segments.append(segment)
+            continue
+        time_range = (
+            round(segment.timeline_start * MICROSECONDS_PER_SECOND),
+            round(segment.duration * MICROSECONDS_PER_SECOND),
+        )
+        matching_panels = panels_by_range.get(time_range, [])
+        if (
+            len(matching_panels) == 1
+            and matching_panels[0].path is not None
+            and matching_panels[0].path.is_file()
+        ):
+            segment = replace(segment, path=matching_panels[0].path)
+        linked_segments.append(segment)
+    return linked_segments
 
 
 def extract_video_cuts(draft_path: str | Path) -> list[VideoCut]:
@@ -218,6 +295,7 @@ def extract_timeline(draft_path: str | Path) -> TimelineProject:
             )
 
     segments.sort(key=lambda item: (item.track_index, item.timeline_start))
+    segments = link_panel_shadows(segments)
     canvas = draft.get("canvas_config") or {}
     duration = _seconds(draft.get("duration"))
     if duration <= 0 and segments:
@@ -233,10 +311,18 @@ def extract_timeline(draft_path: str | Path) -> TimelineProject:
 
 
 def relink_media_in_folder(
-    segments: list[TimelineSegment], media_folder: str | Path
+    segments: list[TimelineSegment],
+    media_folder: str | Path,
+    *,
+    progress_callback: Callable[[int, int], None] | None = None,
+    cancel_event: Event | None = None,
 ) -> tuple[list[TimelineSegment], RelinkSummary]:
     """Relink missing media only when its exact name maps to one compatible file."""
     media_folder = Path(media_folder).expanduser().resolve()
+    if not media_folder.is_dir():
+        raise NotADirectoryError(
+            f"A pasta de mídias não existe ou não pode ser acessada: {media_folder}"
+        )
     audio_suffixes = {".aac", ".flac", ".m4a", ".mp3", ".ogg", ".wav"}
     supported_suffixes = audio_suffixes | {
         ".avi",
@@ -255,19 +341,69 @@ def relink_media_in_folder(
         ".webp",
     }
     files_by_name: dict[str, set[Path]] = {}
-    for file_path in media_folder.rglob("*"):
-        if not file_path.is_file() or file_path.suffix.lower() not in supported_suffixes:
-            continue
-        file_path = file_path.resolve()
-        files_by_name.setdefault(file_path.name.casefold(), set()).add(file_path)
-        files_by_name.setdefault(file_path.stem.casefold(), set()).add(file_path)
+    pending_directories = [media_folder]
+    scanned_directories = 0
+    scanned_files = 0
+    last_reported = (0, 0)
+    while pending_directories:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RelinkCancelledError("A busca de mídias foi cancelada.")
+        directory = pending_directories.pop()
+        try:
+            entries = os.scandir(directory)
+            with entries:
+                for entry in entries:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise RelinkCancelledError("A busca de mídias foi cancelada.")
+                    if entry.is_dir(follow_symlinks=False):
+                        pending_directories.append(Path(entry.path))
+                    elif entry.is_file():
+                        scanned_files += 1
+                        suffix = Path(entry.name).suffix.casefold()
+                        if suffix in supported_suffixes:
+                            file_path = Path(entry.path)
+                            files_by_name.setdefault(
+                                file_path.name.casefold(), set()
+                            ).add(file_path)
+                            files_by_name.setdefault(
+                                file_path.stem.casefold(), set()
+                            ).add(file_path)
+                        if (
+                            progress_callback is not None
+                            and scanned_files - last_reported[1] >= 1000
+                        ):
+                            progress_callback(scanned_directories + 1, scanned_files)
+                            last_reported = (scanned_directories + 1, scanned_files)
+        except OSError as error:
+            raise OSError(
+                f"Não foi possível ler a pasta de mídias '{directory}': {error}"
+            ) from error
+        scanned_directories += 1
+        current = (scanned_directories, scanned_files)
+        if (
+            progress_callback is not None
+            and (
+                scanned_directories - last_reported[0] >= 10
+                or scanned_files - last_reported[1] >= 1000
+                or not pending_directories
+            )
+        ):
+            progress_callback(*current)
+            last_reported = current
 
     paths_by_material: dict[str, Path] = {}
     ambiguous_materials: set[str] = set()
     missing_materials: set[str] = set()
+    path_status: dict[Path, bool] = {}
     for index, segment in enumerate(segments):
-        if segment.path is not None and segment.path.is_file():
+        if _is_source_less_panel_shadow(segment):
             continue
+        if segment.path is not None:
+            if segment.path not in path_status:
+                existing = segment.path.is_file()
+                path_status[segment.path] = existing
+            if path_status[segment.path]:
+                continue
         material_key = segment.media_id or f"segment:{index}"
         if material_key in paths_by_material or material_key in ambiguous_materials:
             continue
@@ -300,6 +436,7 @@ def relink_media_in_folder(
         )
         for index, segment in enumerate(segments)
     ]
+    relinked_segments = link_panel_shadows(relinked_segments)
     return relinked_segments, RelinkSummary(
         linked_materials=len(paths_by_material),
         ambiguous_materials=len(ambiguous_materials),

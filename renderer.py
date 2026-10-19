@@ -17,9 +17,12 @@ from parser import (
     TimelineProject,
     TimelineSegment,
     VideoCut,
+    RelinkCancelledError,
     extract_timeline,
+    link_panel_shadows,
     relink_media_in_folder,
 )
+from filmora_export import FilmoraExportSummary, export_filmora13
 
 
 class RenderProgress:
@@ -525,6 +528,16 @@ def launch_gui() -> None:
     state: dict[str, Any] = {"project": None}
     state["draft_path"] = None
     state["selected_segment"] = None
+    state["media_availability"] = {}
+    state["table_refresh_id"] = 0
+
+    def media_is_available(path: Path | None) -> bool:
+        if path is None:
+            return False
+        cache: dict[Path, bool] = state["media_availability"]
+        if path not in cache:
+            cache[path] = path.is_file()
+        return cache[path]
 
     container = ttk.Frame(root, padding=12)
     container.grid(row=0, column=0, sticky="nsew")
@@ -665,6 +678,30 @@ def launch_gui() -> None:
     refresh_button.grid(row=0, column=4)
     render_button = ttk.Button(action_bar, text="Renderizar", command=lambda: start_render())
     render_button.grid(row=0, column=5, sticky="e")
+    filmora_button = ttk.Button(
+        action_bar,
+        text="Exportar Filmora 13...",
+        command=lambda: export_filmora(),
+    )
+    filmora_button.grid(row=1, column=0, sticky="w", pady=(6, 0))
+    cancel_relink_button = ttk.Button(
+        action_bar,
+        text="Cancelar busca",
+        command=lambda: cancel_bulk_relink(),
+        state="disabled",
+    )
+    cancel_relink_button.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+    busy_controls = (
+        browse_project_button,
+        choose_output_button,
+        relink_button,
+        adjust_button,
+        toggle_track_button,
+        refresh_button,
+        render_button,
+        bulk_relink_button,
+        filmora_button,
+    )
 
     progress_bar = ttk.Progressbar(
         container, variable=progress_var, maximum=100, mode="determinate"
@@ -749,7 +786,7 @@ def launch_gui() -> None:
             for index, segment in track_segments:
                 x1 = label_width + segment.timeline_start * scale
                 x2 = max(x1 + 3, label_width + (segment.timeline_start + segment.duration) * scale)
-                missing = segment.path is None or not segment.path.is_file()
+                missing = not media_is_available(segment.path)
                 if not segment.enabled or missing:
                     color = "#763d42" if missing else "#525b66"
                 elif segment.track_type == "audio":
@@ -797,14 +834,17 @@ def launch_gui() -> None:
                 )
 
     def refresh_table() -> None:
-        timeline_table.delete(*timeline_table.get_children())
+        state["table_refresh_id"] += 1
+        refresh_id = state["table_refresh_id"]
         project = state["project"]
+        timeline_table.delete(*timeline_table.get_children())
         if project is None:
             return
         missing_count = 0
         active_missing_count = 0
+        rows = []
         for index, segment in enumerate(project.segments):
-            file_exists = segment.path is not None and segment.path.is_file()
+            file_exists = media_is_available(segment.path)
             if not file_exists:
                 missing_count += 1
                 if segment.enabled:
@@ -812,45 +852,75 @@ def launch_gui() -> None:
             media_label = (
                 segment.path.name if segment.path is not None else segment.media_name
             )
-            timeline_table.insert(
-                "",
-                "end",
-                iid=str(index),
-                values=(
-                    "Sim" if segment.enabled else "Não",
-                    segment.track_name,
-                    "Áudio"
-                    if segment.track_type == "audio"
-                    else "Imagem"
-                    if segment.media_kind == "photo"
-                    or (segment.path is not None and _is_still_image(segment.path))
-                    else "Vídeo",
-                    media_label,
-                    ", ".join(segment.effects) or "—",
-                    ", ".join(segment.transitions) or "—",
-                    "OK" if file_exists else "Religar",
-                    format_time(segment.timeline_start),
-                    format_time(segment.duration),
-                    format_time(segment.source_start),
-                ),
-                tags=("ready" if file_exists else "missing",),
+            rows.append(
+                (
+                    index,
+                    (
+                        "Sim" if segment.enabled else "Não",
+                        segment.track_name,
+                        "Áudio"
+                        if segment.track_type == "audio"
+                        else "Imagem"
+                        if segment.media_kind == "photo"
+                        or (segment.path is not None and _is_still_image(segment.path))
+                        else "Vídeo",
+                        media_label,
+                        ", ".join(segment.effects) or "—",
+                        ", ".join(segment.transitions) or "—",
+                        "OK" if file_exists else "Religar",
+                        format_time(segment.timeline_start),
+                        format_time(segment.duration),
+                        format_time(segment.source_start),
+                    ),
+                    "ready" if file_exists else "missing",
+                )
             )
         has_active_video = any(
             item.enabled and item.track_type == "video" and item.path is not None
             for item in project.segments
         )
+        all_active_media_available = all(
+            not item.enabled or media_is_available(item.path)
+            for item in project.segments
+        )
         render_button.configure(
             state="normal" if active_missing_count == 0 and has_active_video else "disabled"
         )
-        active_tracks = len(
-            {item.track_index for item in project.segments if item.enabled}
+        filmora_button.configure(
+            state=(
+                "normal"
+                if all_active_media_available
+                and has_active_video
+                and filmora_template_path().is_file()
+                else "disabled"
+            )
         )
-        status_var.set(
-            f"{len(project.segments)} clipes · {active_tracks} faixas ativas · "
-            f"{active_missing_count}/{missing_count} mídia(s) ausentes · "
-            f"{project.width}×{project.height} · {project.fps:g} FPS"
-        )
-        draw_timeline()
+        active_tracks = len({item.track_index for item in project.segments if item.enabled})
+
+        def insert_batch(start: int = 0) -> None:
+            if refresh_id != state["table_refresh_id"]:
+                return
+            end = min(start + 100, len(rows))
+            for index, values, tag in rows[start:end]:
+                timeline_table.insert(
+                    "",
+                    "end",
+                    iid=str(index),
+                    values=values,
+                    tags=(tag,),
+                )
+            if end < len(rows):
+                status_var.set(f"Atualizando lista de clipes... {end}/{len(rows)}")
+                root.after(1, insert_batch, end)
+                return
+            status_var.set(
+                f"{len(project.segments)} clipes · {active_tracks} faixas ativas · "
+                f"{active_missing_count}/{missing_count} mídia(s) ausentes · "
+                f"{project.width}×{project.height} · {project.fps:g} FPS"
+            )
+            draw_timeline()
+
+        insert_batch()
 
     def choose_project() -> None:
         folder = filedialog.askdirectory(title="Selecione a pasta do projeto")
@@ -873,6 +943,7 @@ def launch_gui() -> None:
             return
         state["project"] = project
         state["draft_path"] = draft_file
+        state["media_availability"] = {}
         project_var.set(str(folder))
         progress_var.set(0)
         refresh_table()
@@ -888,6 +959,91 @@ def launch_gui() -> None:
         )
         if output:
             output_var.set(output)
+
+    def filmora_template_path() -> Path:
+        app_directory = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+        return app_directory / "MODELO EDIÇÃO FILMORA.wfp"
+
+    def finish_filmora_export(
+        summary: FilmoraExportSummary | None, error: Exception | None
+    ) -> None:
+        for control in busy_controls:
+            control.configure(state="normal")
+        if error is not None:
+            status_var.set("Exportação Filmora falhou; corrija as mídias e tente novamente.")
+            messagebox.showerror(
+                "Não foi possível exportar para o Filmora", str(error), parent=root
+            )
+            refresh_table()
+            return
+        if summary is None:
+            return
+        refresh_table()
+        progress_var.set(100)
+        status_var.set(f"Projeto Filmora criado: {summary.output_path}")
+        details = [
+            f"Projeto salvo em:\n{summary.output_path}",
+            "",
+            f"Vídeos: {summary.video_clips} · Imagens: {summary.image_clips} · "
+            f"Áudios: {summary.audio_clips} · Transições: {summary.transitions}",
+        ]
+        if summary.unsupported_effects:
+            effect_list = ", ".join(
+                f"{name} ({count})" for name, count in summary.unsupported_effects[:8]
+            )
+            details.extend(["", f"Efeitos não convertidos: {effect_list}"])
+        if summary.warnings:
+            details.extend(["", *summary.warnings])
+        messagebox.showwarning(
+            "Exportação Filmora concluída",
+            "\n".join(details),
+            parent=root,
+        )
+
+    def export_filmora() -> None:
+        project = state["project"]
+        draft_path = state["draft_path"]
+        if project is None or draft_path is None:
+            messagebox.showerror(
+                "Projeto inválido", "Abra uma pasta de projeto primeiro.", parent=root
+            )
+            return
+        template_path = filmora_template_path()
+        if not template_path.is_file():
+            messagebox.showerror(
+                "Modelo Filmora indisponível",
+                f"O modelo do Filmora 13 não foi encontrado:\n{template_path}",
+                parent=root,
+            )
+            return
+        output = filedialog.asksaveasfilename(
+            title="Salvar projeto para Filmora 13",
+            defaultextension=".wfp",
+            filetypes=[("Projeto Wondershare Filmora", "*.wfp")],
+            initialdir=str(draft_path.parent),
+            initialfile=f"{draft_path.parent.name}_Filmora13.wfp",
+            parent=root,
+        )
+        if not output:
+            return
+        for control in busy_controls:
+            control.configure(state="disabled")
+        progress_var.set(0)
+        status_var.set("Convertendo cortes, faixas, transições e áudio para Filmora 13...")
+
+        def worker() -> None:
+            try:
+                result = export_filmora13(
+                    draft_path,
+                    output,
+                    template_path,
+                    project,
+                )
+                root.after(0, finish_filmora_export, result, None)
+            except Exception as error:
+                root.after(0, finish_filmora_export, None, error)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def selected_index() -> int | None:
         selection = timeline_table.selection()
@@ -933,16 +1089,27 @@ def launch_gui() -> None:
         if not file_path:
             return
         selected_path = Path(file_path).resolve()
-        project.segments = [
-            replace(item, path=selected_path)
-            if (segment.media_id and item.media_id == segment.media_id)
-            or item is segment
-            else item
-            for item in project.segments
-        ]
+        project.segments = link_panel_shadows(
+            [
+                replace(item, path=selected_path)
+                if (segment.media_id and item.media_id == segment.media_id)
+                or item is segment
+                else item
+                for item in project.segments
+            ]
+        )
         refresh_table()
 
+    bulk_relink_cancel: threading.Event | None = None
+
+    def cancel_bulk_relink() -> None:
+        if bulk_relink_cancel is not None:
+            bulk_relink_cancel.set()
+            cancel_relink_button.configure(state="disabled")
+            status_var.set("Cancelando busca de mídias...")
+
     def bulk_relink_folder() -> None:
+        nonlocal bulk_relink_cancel
         project = state["project"]
         if project is None:
             messagebox.showinfo("Projeto não aberto", "Abra um projeto antes de buscar mídias.", parent=root)
@@ -953,32 +1120,71 @@ def launch_gui() -> None:
         )
         if not folder:
             return
-        scan_controls = (
-            browse_project_button,
-            choose_output_button,
-            relink_button,
-            adjust_button,
-            toggle_track_button,
-            refresh_button,
-            render_button,
-            bulk_relink_button,
-        )
-        for control in scan_controls:
+        bulk_relink_cancel = threading.Event()
+        cancel_event = bulk_relink_cancel
+        for control in busy_controls:
             control.configure(state="disabled")
+        cancel_relink_button.configure(state="normal")
+        progress_var.set(0)
+        progress_bar.configure(mode="indeterminate")
+        progress_bar.start(100)
         status_var.set("Procurando mídias por nome e caminho...")
+
+        def report_scan_progress(directories: int, files: int) -> None:
+            root.after(
+                0,
+                lambda count_dirs=directories, count_files=files: status_var.set(
+                    f"Procurando mídias... {count_dirs} pastas · {count_files} arquivos verificados"
+                ),
+            )
 
         def worker() -> None:
             try:
-                segments, summary = relink_media_in_folder(project.segments, folder)
-                root.after(0, finish_bulk_relink, segments, summary, None)
+                segments, summary = relink_media_in_folder(
+                    project.segments,
+                    folder,
+                    progress_callback=report_scan_progress,
+                    cancel_event=cancel_event,
+                )
+                root.after(
+                    0,
+                    lambda: status_var.set(
+                        "Busca concluída; verificando os caminhos das mídias..."
+                    ),
+                )
+                media_paths = sorted(
+                    {item.path for item in segments if item.path is not None},
+                    key=lambda path: str(path).casefold(),
+                )
+                availability = {}
+                for index, path in enumerate(media_paths, start=1):
+                    availability[path] = path.is_file()
+                    if index % 50 == 0 or index == len(media_paths):
+                        root.after(
+                            0,
+                            lambda current=index, total=len(media_paths): status_var.set(
+                                f"Verificando mídias... {current}/{total}"
+                            ),
+                        )
+                root.after(0, finish_bulk_relink, segments, summary, availability, None)
             except Exception as error:
-                root.after(0, finish_bulk_relink, None, None, error)
+                root.after(0, finish_bulk_relink, None, None, None, error)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def finish_bulk_relink(segments, summary, error) -> None:
-        for control in scan_controls:
+    def finish_bulk_relink(segments, summary, availability, error) -> None:
+        nonlocal bulk_relink_cancel
+        progress_bar.stop()
+        progress_bar.configure(mode="determinate")
+        progress_var.set(0)
+        cancel_relink_button.configure(state="disabled")
+        for control in busy_controls:
             control.configure(state="normal")
+        bulk_relink_cancel = None
+        if isinstance(error, RelinkCancelledError):
+            refresh_table()
+            status_var.set("Busca de mídias cancelada.")
+            return
         if error:
             messagebox.showerror("Falha ao buscar mídias", str(error), parent=root)
             refresh_table()
@@ -986,6 +1192,7 @@ def launch_gui() -> None:
         project = state["project"]
         if project is None or segments is None or summary is None:
             return
+        state["media_availability"] = availability or {}
         project.segments = segments
         refresh_table()
         messagebox.showinfo(
@@ -1061,14 +1268,8 @@ def launch_gui() -> None:
         status_var.set(f"{percent}% · {label}")
 
     def finish_render(output: Path | None, error: Exception | None) -> None:
-        render_button.configure(state="normal")
-        browse_project_button.configure(state="normal")
-        choose_output_button.configure(state="normal")
-        relink_button.configure(state="normal")
-        adjust_button.configure(state="normal")
-        toggle_track_button.configure(state="normal")
-        bulk_relink_button.configure(state="normal")
-        refresh_button.configure(state="normal")
+        for control in busy_controls:
+            control.configure(state="normal")
         if error:
             refresh_table()
             status_var.set("Renderização falhou; consulte as mídias e o erro.")
@@ -1107,6 +1308,7 @@ def launch_gui() -> None:
         toggle_track_button.configure(state="disabled")
         bulk_relink_button.configure(state="disabled")
         refresh_button.configure(state="disabled")
+        filmora_button.configure(state="disabled")
         progress_var.set(0)
         status_var.set("Preparando renderização...")
 

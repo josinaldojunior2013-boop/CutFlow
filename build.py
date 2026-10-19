@@ -20,6 +20,8 @@ def main() -> None:
         "--windowed",
         "--collect-all",
         "imageio_ffmpeg",
+        "--add-data",
+        f"{project_dir / 'MODELO EDIÇÃO FILMORA.wfp'};.",
         "--name",
         "CapCutLightRenderer",
         str(project_dir / "renderer.py"),
