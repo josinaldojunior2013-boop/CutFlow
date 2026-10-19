@@ -520,6 +520,178 @@ def launch_gui() -> None:
     root.title("CapCut Light Renderer")
     root.geometry("1180x720")
     root.minsize(900, 560)
+    palette = {
+        "background": "#111018",
+        "surface": "#1b1825",
+        "surface_raised": "#252033",
+        "surface_hover": "#302943",
+        "border": "#393149",
+        "text": "#f4f0fa",
+        "muted": "#aaa1b8",
+        "accent": "#b44dff",
+        "accent_hover": "#c477ff",
+        "accent_pressed": "#9235d9",
+        "accent_glow": "#e0b3ff",
+        "mint": "#58e0b1",
+        "warning": "#ff718b",
+        "disabled": "#625a70",
+    }
+    root.configure(background=palette["background"])
+    style = ttk.Style(root)
+    style.theme_use("clam")
+    style.configure(
+        ".",
+        background=palette["background"],
+        foreground=palette["text"],
+        font=("Segoe UI", 9),
+    )
+    style.configure("TFrame", background=palette["background"])
+    style.configure(
+        "TLabel",
+        background=palette["background"],
+        foreground=palette["text"],
+    )
+    style.configure(
+        "Status.TLabel",
+        background=palette["background"],
+        foreground=palette["accent_glow"],
+        font=("Segoe UI Semibold", 9),
+    )
+    style.configure(
+        "Hint.TLabel",
+        background=palette["background"],
+        foreground=palette["muted"],
+        font=("Segoe UI", 8),
+    )
+    style.configure(
+        "TButton",
+        background=palette["surface_raised"],
+        foreground=palette["text"],
+        bordercolor=palette["border"],
+        lightcolor=palette["surface_raised"],
+        darkcolor=palette["surface_raised"],
+        padding=(12, 7),
+        relief="flat",
+        focuscolor=palette["accent"],
+    )
+    style.map(
+        "TButton",
+        background=[
+            ("disabled", palette["surface"]),
+            ("pressed", palette["accent_pressed"]),
+            ("active", palette["surface_hover"]),
+        ],
+        foreground=[
+            ("disabled", palette["disabled"]),
+            ("!disabled", palette["text"]),
+        ],
+        bordercolor=[("focus", palette["accent"])],
+    )
+    style.configure(
+        "Accent.TButton",
+        background=palette["accent"],
+        foreground="#ffffff",
+        bordercolor=palette["accent"],
+        lightcolor=palette["accent"],
+        darkcolor=palette["accent"],
+        font=("Segoe UI Semibold", 9),
+    )
+    style.map(
+        "Accent.TButton",
+        background=[
+            ("disabled", palette["surface"]),
+            ("pressed", palette["accent_pressed"]),
+            ("active", palette["accent_hover"]),
+        ],
+        foreground=[
+            ("disabled", palette["disabled"]),
+            ("!disabled", "#ffffff"),
+        ],
+    )
+    style.configure(
+        "Secondary.TButton",
+        background=palette["surface"],
+        foreground=palette["accent_glow"],
+        bordercolor=palette["border"],
+    )
+    style.map(
+        "Secondary.TButton",
+        background=[
+            ("disabled", palette["surface"]),
+            ("pressed", palette["accent_pressed"]),
+            ("active", palette["surface_hover"]),
+        ],
+        foreground=[
+            ("disabled", palette["disabled"]),
+            ("!disabled", palette["accent_glow"]),
+        ],
+    )
+    style.configure(
+        "TEntry",
+        fieldbackground=palette["surface"],
+        foreground=palette["text"],
+        insertcolor=palette["text"],
+        bordercolor=palette["border"],
+        lightcolor=palette["border"],
+        darkcolor=palette["border"],
+        padding=7,
+    )
+    style.configure(
+        "TScale",
+        background=palette["background"],
+        troughcolor=palette["surface_raised"],
+        sliderthickness=16,
+    )
+    style.configure(
+        "Horizontal.TProgressbar",
+        background=palette["accent"],
+        troughcolor=palette["surface"],
+        bordercolor=palette["border"],
+        lightcolor=palette["accent_hover"],
+        darkcolor=palette["accent_pressed"],
+    )
+    style.configure(
+        "Treeview",
+        background=palette["surface"],
+        fieldbackground=palette["surface"],
+        foreground=palette["text"],
+        bordercolor=palette["border"],
+        rowheight=28,
+        font=("Segoe UI", 9),
+    )
+    style.map(
+        "Treeview",
+        background=[("selected", "#492c63")],
+        foreground=[("selected", "#ffffff")],
+    )
+    style.configure(
+        "Treeview.Heading",
+        background=palette["surface_raised"],
+        foreground=palette["accent_glow"],
+        bordercolor=palette["border"],
+        relief="flat",
+        padding=(8, 7),
+        font=("Segoe UI Semibold", 9),
+    )
+    style.map(
+        "Treeview.Heading",
+        background=[("active", palette["surface_hover"])],
+        foreground=[("active", "#ffffff")],
+    )
+    style.configure(
+        "Horizontal.TScrollbar",
+        background=palette["surface_raised"],
+        troughcolor=palette["background"],
+        bordercolor=palette["background"],
+        arrowcolor=palette["muted"],
+    )
+    style.configure(
+        "Vertical.TScrollbar",
+        background=palette["surface_raised"],
+        troughcolor=palette["background"],
+        bordercolor=palette["background"],
+        arrowcolor=palette["muted"],
+    )
 
     project_var = tk.StringVar(value="Nenhum projeto selecionado")
     output_var = tk.StringVar()
@@ -596,9 +768,9 @@ def launch_gui() -> None:
     timeline_canvas = tk.Canvas(
         container,
         height=158,
-        background="#20252c",
+        background=palette["surface"],
         highlightthickness=1,
-        highlightbackground="#38414c",
+        highlightbackground=palette["accent"],
     )
     timeline_canvas.grid(row=3, column=0, sticky="ew")
     timeline_scrollbar = ttk.Scrollbar(
@@ -641,8 +813,8 @@ def launch_gui() -> None:
     for column, (label, width) in headings.items():
         timeline_table.heading(column, text=label)
         timeline_table.column(column, width=width, minwidth=65, stretch=column == "media")
-    timeline_table.tag_configure("missing", foreground="#b42318")
-    timeline_table.tag_configure("ready", foreground="#18794e")
+    timeline_table.tag_configure("missing", foreground=palette["warning"])
+    timeline_table.tag_configure("ready", foreground=palette["mint"])
     vertical_scroll = ttk.Scrollbar(
         table_frame, orient="vertical", command=timeline_table.yview
     )
@@ -676,12 +848,18 @@ def launch_gui() -> None:
     bulk_relink_button.grid(row=0, column=3, padx=(0, 6))
     refresh_button = ttk.Button(action_bar, text="Recarregar", command=lambda: choose_project())
     refresh_button.grid(row=0, column=4)
-    render_button = ttk.Button(action_bar, text="Renderizar", command=lambda: start_render())
+    render_button = ttk.Button(
+        action_bar,
+        text="Renderizar",
+        command=lambda: start_render(),
+        style="Accent.TButton",
+    )
     render_button.grid(row=0, column=5, sticky="e")
     filmora_button = ttk.Button(
         action_bar,
         text="Exportar Filmora 13...",
         command=lambda: export_filmora(),
+        style="Secondary.TButton",
     )
     filmora_button.grid(row=1, column=0, sticky="w", pady=(6, 0))
     cancel_relink_button = ttk.Button(
@@ -707,13 +885,16 @@ def launch_gui() -> None:
         container, variable=progress_var, maximum=100, mode="determinate"
     )
     progress_bar.grid(row=7, column=0, sticky="ew", pady=(8, 4))
-    ttk.Label(container, textvariable=status_var, anchor="w").grid(
+    ttk.Label(
+        container, textvariable=status_var, anchor="w", style="Status.TLabel"
+    ).grid(
         row=8, column=0, sticky="ew"
     )
     ttk.Label(
         container,
         text="Renderiza vídeo, imagem e áudio. Alguns efeitos e transições do CapCut podem exigir ajustes manuais.",
         anchor="w",
+        style="Hint.TLabel",
     ).grid(row=9, column=0, sticky="ew", pady=(5, 0))
 
     def format_time(seconds: float) -> str:
@@ -757,12 +938,14 @@ def launch_gui() -> None:
         tick = 0
         while tick <= project.duration:
             x = label_width + tick * scale
-            timeline_canvas.create_line(x, 0, x, total_height, fill="#3c4652")
+            timeline_canvas.create_line(
+                x, 0, x, total_height, fill=palette["border"]
+            )
             timeline_canvas.create_text(
                 x + 3,
                 3,
                 text=format_time(tick),
-                fill="#c3ccd6",
+                fill=palette["muted"],
                 anchor="nw",
                 font=("Segoe UI", 8),
             )
@@ -779,7 +962,7 @@ def launch_gui() -> None:
                 6,
                 y + lane_height / 2,
                 text=track_name[:20],
-                fill="#e1e7ed",
+                fill=palette["text"],
                 anchor="w",
                 font=("Segoe UI", 8),
             )
@@ -788,15 +971,15 @@ def launch_gui() -> None:
                 x2 = max(x1 + 3, label_width + (segment.timeline_start + segment.duration) * scale)
                 missing = not media_is_available(segment.path)
                 if not segment.enabled or missing:
-                    color = "#763d42" if missing else "#525b66"
+                    color = "#74334a" if missing else "#474151"
                 elif segment.track_type == "audio":
-                    color = "#337c63"
+                    color = "#287d70"
                 elif segment.media_kind == "photo" or (
                     segment.path is not None and _is_still_image(segment.path)
                 ):
-                    color = "#986f31"
+                    color = "#94652c"
                 else:
-                    color = "#3d6d9a"
+                    color = "#653b91"
                 selected = state["selected_segment"] == index
                 block = timeline_canvas.create_rectangle(
                     x1,
@@ -804,8 +987,8 @@ def launch_gui() -> None:
                     x2,
                     y + lane_height,
                     fill=color,
-                    outline="#f0c36d" if selected else color,
-                    width=2 if selected else 1,
+                    outline=palette["accent_glow"] if selected else color,
+                    width=3 if selected else 1,
                 )
                 if x2 - x1 > 35:
                     markers = ("E" if segment.effects else "") + ("T" if segment.transitions else "")
@@ -815,7 +998,7 @@ def launch_gui() -> None:
                         x1 + 4,
                         y + lane_height / 2,
                         text=label,
-                        fill="white",
+                        fill="#ffffff",
                         anchor="w",
                         font=("Segoe UI", 8),
                         tags=(f"segment-{index}",),
