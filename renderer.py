@@ -119,6 +119,19 @@ def _validate_render_clip_limit(segments: list[TimelineSegment]) -> None:
         )
 
 
+def _resolve_render_temp_directory(
+    temp_directory: str | Path | None,
+) -> Path | None:
+    if temp_directory is None or not str(temp_directory).strip():
+        return None
+    resolved_directory = Path(temp_directory).expanduser().resolve()
+    if not resolved_directory.is_dir():
+        raise NotADirectoryError(
+            f"A pasta temporária de renderização não existe: {resolved_directory}"
+        )
+    return resolved_directory
+
+
 def _ffmpeg_base(ffmpeg: str) -> list[str]:
     return [
         ffmpeg,
@@ -391,6 +404,7 @@ def render_timeline(
     output_path: str | Path,
     ffmpeg: str | None = None,
     progress_callback: Callable[[int, str], None] | None = None,
+    temp_directory: str | Path | None = None,
 ) -> Path:
     """Compose timed video and audio tracks into an MP4 using CPU encoding."""
     if project.duration <= 0:
@@ -408,6 +422,7 @@ def render_timeline(
             f"{missing_segments[0].media_name}"
         )
 
+    render_temp_directory = _resolve_render_temp_directory(temp_directory)
     ffmpeg = resolve_ffmpeg(ffmpeg)
     output_path = Path(output_path).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -428,7 +443,9 @@ def render_timeline(
         project.duration * (video_track_count * 2 + 1),
         progress_callback or (lambda percent, label: None),
     )
-    with tempfile.TemporaryDirectory(prefix="capcut-light-") as temp_dir:
+    with tempfile.TemporaryDirectory(
+        prefix="capcut-light-", dir=render_temp_directory
+    ) as temp_dir:
         temp_path = Path(temp_dir)
         video_tracks = _render_video_tracks(project, temp_path, ffmpeg, progress)
         if not video_tracks:
@@ -708,6 +725,7 @@ def launch_gui() -> None:
 
     project_var = tk.StringVar(value="Nenhum projeto selecionado")
     output_var = tk.StringVar()
+    temp_directory_var = tk.StringVar(value="Automático (temporários do Windows)")
     status_var = tk.StringVar(value="Selecione a pasta do projeto CapCut.")
     progress_var = tk.IntVar(value=0)
     state: dict[str, Any] = {"project": None}
@@ -752,6 +770,21 @@ def launch_gui() -> None:
         output_bar, text="Salvar como...", command=lambda: choose_output()
     )
     choose_output_button.grid(row=0, column=2)
+    ttk.Label(output_bar, text="Temporários").grid(
+        row=1, column=0, padx=(0, 8), pady=(6, 0)
+    )
+    ttk.Entry(
+        output_bar,
+        textvariable=temp_directory_var,
+        state="readonly",
+    ).grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=(6, 0))
+    choose_temp_directory_button = ttk.Button(
+        output_bar,
+        text="Escolher disco...",
+        command=lambda: choose_temp_directory(),
+        style="Secondary.TButton",
+    )
+    choose_temp_directory_button.grid(row=1, column=2, pady=(6, 0))
 
     timeline_header = ttk.Frame(container)
     timeline_header.grid(row=2, column=0, sticky="ew", pady=(2, 4))
@@ -885,6 +918,7 @@ def launch_gui() -> None:
     busy_controls = (
         browse_project_button,
         choose_output_button,
+        choose_temp_directory_button,
         relink_button,
         adjust_button,
         toggle_track_button,
@@ -1168,6 +1202,27 @@ def launch_gui() -> None:
         )
         if output:
             output_var.set(output)
+
+    def choose_temp_directory() -> None:
+        directory = filedialog.askdirectory(
+            title="Escolha um disco/pasta com bastante espaço livre para arquivos temporários",
+            parent=root,
+        )
+        if directory:
+            temp_directory_var.set(directory)
+            try:
+                free_gigabytes = shutil.disk_usage(directory).free / (1024**3)
+            except OSError as error:
+                messagebox.showerror(
+                    "Disco temporário indisponível",
+                    f"Não foi possível verificar o espaço livre:\n{error}",
+                    parent=root,
+                )
+                temp_directory_var.set("Automático (temporários do Windows)")
+                return
+            status_var.set(
+                f"Temporários em {directory} · {free_gigabytes:.1f} GB livres"
+            )
 
     def filmora_template_path() -> Path:
         app_directory = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
@@ -1482,7 +1537,17 @@ def launch_gui() -> None:
         if error:
             refresh_table()
             status_var.set("Renderização falhou; consulte as mídias e o erro.")
-            messagebox.showerror("Erro ao renderizar", str(error), parent=root)
+            error_details = str(error)
+            if any(
+                phrase in error_details.casefold()
+                for phrase in ("no space left on device", "not enough space", "disk full")
+            ):
+                error_details = (
+                    "O disco usado para os arquivos temporários ficou sem espaço. "
+                    "Escolha um disco com mais espaço no campo Temporários e tente novamente.\n\n"
+                    + error_details
+                )
+            messagebox.showerror("Erro ao renderizar", error_details, parent=root)
             return
         progress_var.set(100)
         status_var.set(f"100% · Renderização concluída: {output}")
@@ -1518,6 +1583,7 @@ def launch_gui() -> None:
         bulk_relink_button.configure(state="disabled")
         refresh_button.configure(state="disabled")
         filmora_button.configure(state="disabled")
+        choose_temp_directory_button.configure(state="disabled")
         progress_var.set(0)
         status_var.set("Preparando renderização...")
 
@@ -1526,7 +1592,15 @@ def launch_gui() -> None:
 
         def worker() -> None:
             try:
-                result = render_timeline(project, output_file, progress_callback=report_progress)
+                temp_directory = temp_directory_var.get()
+                if temp_directory.casefold().startswith("automático"):
+                    temp_directory = ""
+                result = render_timeline(
+                    project,
+                    output_file,
+                    progress_callback=report_progress,
+                    temp_directory=temp_directory or None,
+                )
                 root.after(0, finish_render, result, None)
             except Exception as error:
                 root.after(0, finish_render, None, error)
@@ -1551,10 +1625,19 @@ def main() -> None:
     argument_parser.add_argument(
         "--ffmpeg", help="Executável do FFmpeg (detectado automaticamente por padrão)"
     )
+    argument_parser.add_argument(
+        "--temp-dir",
+        help="Pasta em um disco com espaço livre para os arquivos temporários de renderização",
+    )
     args = argument_parser.parse_args()
 
     project = extract_timeline(args.draft)
-    output_path = render_timeline(project, args.output, ffmpeg=args.ffmpeg)
+    output_path = render_timeline(
+        project,
+        args.output,
+        ffmpeg=args.ffmpeg,
+        temp_directory=args.temp_dir,
+    )
     print(f"Vídeo renderizado: {output_path}")
 
 

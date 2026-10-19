@@ -1,7 +1,15 @@
 import unittest
+from pathlib import Path
+import tempfile
+from unittest.mock import patch
 
 from parser import TimelineProject, TimelineSegment
-from renderer import MAX_RENDER_CLIPS, _validate_render_clip_limit, render_timeline
+from renderer import (
+    MAX_RENDER_CLIPS,
+    _resolve_render_temp_directory,
+    _validate_render_clip_limit,
+    render_timeline,
+)
 
 
 def make_segment(enabled: bool = True) -> TimelineSegment:
@@ -42,6 +50,54 @@ class RenderClipLimitTests(unittest.TestCase):
         segments.append(make_segment(enabled=False))
 
         _validate_render_clip_limit(segments)
+
+    def test_resolves_user_selected_temporary_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(
+                _resolve_render_temp_directory(directory),
+                Path(directory).resolve(),
+            )
+
+    def test_rejects_missing_temporary_directory(self) -> None:
+        with self.assertRaisesRegex(NotADirectoryError, "pasta temporária"):
+            _resolve_render_temp_directory("missing-temp-path")
+
+    def test_render_uses_selected_directory_for_intermediates(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            temp_directory = root_path / "scratch"
+            temp_directory.mkdir()
+            media_path = root_path / "source.mp4"
+            media_path.touch()
+            segment = TimelineSegment(
+                path=media_path,
+                track_type="video",
+                track_index=0,
+                source_start=0,
+                timeline_start=0,
+                duration=1,
+                volume=1,
+                speed=1,
+            )
+            project = TimelineProject([segment], 1, 1920, 1080, 30)
+            temp_roots: list[Path] = []
+
+            def render_tracks(_project, temp_path, _ffmpeg, _progress):
+                temp_roots.append(temp_path.parent)
+                return [temp_path / "track.mov"]
+
+            with (
+                patch("renderer.resolve_ffmpeg", return_value="ffmpeg"),
+                patch("renderer._render_video_tracks", side_effect=render_tracks),
+                patch("renderer._run_stage"),
+            ):
+                render_timeline(
+                    project,
+                    root_path / "output.mp4",
+                    temp_directory=temp_directory,
+                )
+
+            self.assertEqual(temp_roots, [temp_directory.resolve()])
 
 
 if __name__ == "__main__":
