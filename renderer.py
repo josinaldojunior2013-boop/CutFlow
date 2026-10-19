@@ -105,6 +105,18 @@ def resolve_ffmpeg(ffmpeg: str | None) -> str:
 
 
 STILL_IMAGE_SUFFIXES = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+MAX_RENDER_CLIPS = 2000
+
+
+def _validate_render_clip_limit(segments: list[TimelineSegment]) -> None:
+    active_clip_count = sum(segment.enabled for segment in segments)
+    if active_clip_count > MAX_RENDER_CLIPS:
+        limit = f"{MAX_RENDER_CLIPS:,}".replace(",", ".")
+        count = f"{active_clip_count:,}".replace(",", ".")
+        raise ValueError(
+            f"A renderização aceita até {limit} clipes ativos por projeto. "
+            f"Esta timeline tem {count}. Ignore algumas faixas ou clipes e tente novamente."
+        )
 
 
 def _ffmpeg_base(ffmpeg: str) -> list[str]:
@@ -384,6 +396,7 @@ def render_timeline(
     if project.duration <= 0:
         raise ValueError("O rascunho não informa uma duração de timeline válida.")
     active_segments = [item for item in project.segments if item.enabled]
+    _validate_render_clip_limit(active_segments)
     if not any(item.track_type == "video" and item.path is not None for item in active_segments):
         raise ValueError("Nenhuma mídia visual válida foi encontrada no rascunho.")
     missing_segments = [
@@ -1067,7 +1080,13 @@ def launch_gui() -> None:
             for item in project.segments
         )
         render_button.configure(
-            state="normal" if active_missing_count == 0 and has_active_video else "disabled"
+            state=(
+                "normal"
+                if active_missing_count == 0
+                and has_active_video
+                and sum(item.enabled for item in project.segments) <= MAX_RENDER_CLIPS
+                else "disabled"
+            )
         )
         filmora_button.configure(
             state=(
@@ -1101,6 +1120,13 @@ def launch_gui() -> None:
                 f"{active_missing_count}/{missing_count} mídia(s) ausentes · "
                 f"{project.width}×{project.height} · {project.fps:g} FPS"
             )
+            active_clip_count = sum(item.enabled for item in project.segments)
+            if active_clip_count > MAX_RENDER_CLIPS:
+                active_count = f"{active_clip_count:,}".replace(",", ".")
+                clip_limit = f"{MAX_RENDER_CLIPS:,}".replace(",", ".")
+                status_var.set(
+                    f"{active_count} clipes ativos; limite de renderização: {clip_limit}"
+                )
             draw_timeline()
 
         insert_batch()
