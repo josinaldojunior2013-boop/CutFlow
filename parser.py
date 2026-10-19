@@ -52,6 +52,7 @@ class TimelineSegment:
     raw_path: str = ""
     effects: tuple[str, ...] = ()
     transitions: tuple[str, ...] = ()
+    source_segment_index: int = -1
 
 
 @dataclass
@@ -234,7 +235,7 @@ def extract_timeline(draft_path: str | Path) -> TimelineProject:
         track_type = track.get("type")
         if track_type not in {"video", "audio"}:
             continue
-        for segment in track.get("segments", []):
+        for segment_index, segment in enumerate(track.get("segments", [])):
             if not segment.get("visible", True):
                 continue
             material_id = segment.get("material_id")
@@ -291,6 +292,7 @@ def extract_timeline(draft_path: str | Path) -> TimelineProject:
                     raw_path=material.get("path") or material_path or "",
                     effects=effects,
                     transitions=transitions,
+                    source_segment_index=segment_index,
                 )
             )
 

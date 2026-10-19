@@ -23,6 +23,7 @@ from parser import (
     relink_media_in_folder,
 )
 from filmora_export import FilmoraExportSummary, export_filmora13
+from project_io import save_capcut_draft
 
 
 class RenderProgress:
@@ -547,7 +548,7 @@ def launch_gui() -> None:
     from tkinter import filedialog, messagebox, ttk
 
     root = tk.Tk()
-    root.title("CapCut Light Renderer")
+    root.title("CutFlow Lite — Editor de projetos CapCut")
     root.geometry("1180x720")
     root.minsize(900, 560)
     palette = {
@@ -915,6 +916,14 @@ def launch_gui() -> None:
         state="disabled",
     )
     cancel_relink_button.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+    save_capcut_button = ttk.Button(
+        action_bar,
+        text="Salvar no CapCut",
+        command=lambda: save_capcut_project(),
+        style="Secondary.TButton",
+        state="disabled",
+    )
+    save_capcut_button.grid(row=1, column=2, sticky="w", padx=(8, 0), pady=(6, 0))
     busy_controls = (
         browse_project_button,
         choose_output_button,
@@ -926,6 +935,7 @@ def launch_gui() -> None:
         render_button,
         bulk_relink_button,
         filmora_button,
+        save_capcut_button,
     )
 
     progress_bar = ttk.Progressbar(
@@ -1131,6 +1141,7 @@ def launch_gui() -> None:
                 else "disabled"
             )
         )
+        save_capcut_button.configure(state="normal")
         active_tracks = len({item.track_index for item in project.segments if item.enabled})
 
         def insert_batch(start: int = 0) -> None:
@@ -1202,6 +1213,36 @@ def launch_gui() -> None:
         )
         if output:
             output_var.set(output)
+
+    def save_capcut_project() -> None:
+        project = state["project"]
+        draft_path = state["draft_path"]
+        if project is None or draft_path is None:
+            messagebox.showerror(
+                "Projeto inválido", "Abra um projeto CapCut antes de salvar.", parent=root
+            )
+            return
+        if not messagebox.askyesno(
+            "Salvar alterações no CapCut",
+            "Isso atualizará o draft_content.json original. Uma cópia de segurança "
+            "será criada automaticamente antes de salvar. Feche o projeto no CapCut "
+            "antes de continuar. Deseja salvar?",
+            parent=root,
+        ):
+            return
+        try:
+            backup_path = save_capcut_draft(draft_path, project)
+        except Exception as error:
+            messagebox.showerror(
+                "Não foi possível salvar o projeto CapCut", str(error), parent=root
+            )
+            return
+        messagebox.showinfo(
+            "Projeto CapCut salvo",
+            f"As alterações foram gravadas em:\n{draft_path}\n\n"
+            f"Cópia de segurança:\n{backup_path}",
+            parent=root,
+        )
 
     def choose_temp_directory() -> None:
         directory = filedialog.askdirectory(
